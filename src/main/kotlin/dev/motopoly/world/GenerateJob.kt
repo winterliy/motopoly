@@ -1,6 +1,7 @@
 package dev.motopoly.world
 
 import dev.motopoly.terrain.GeneratePlan
+import dev.motopoly.terrain.OreTable
 import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.block.data.BlockData
@@ -27,6 +28,23 @@ object GenerateJob {
     private val MEADOW = ColumnProfile(
         Material.GRASS_BLOCK.createBlockData(), Material.DIRT.createBlockData(), 3, STONE
     )
+    private val DIRT = Material.DIRT.createBlockData()
+    // Surface blocks that only make sense under open sky.
+    private val TOPSOIL = setOf(
+        Material.GRASS_BLOCK, Material.PODZOL, Material.MYCELIUM, Material.DIRT_PATH, Material.FARMLAND,
+    )
+    private val STONE_ORES = mapOf(
+        OreTable.Ore.COAL to Material.COAL_ORE, OreTable.Ore.IRON to Material.IRON_ORE,
+        OreTable.Ore.COPPER to Material.COPPER_ORE, OreTable.Ore.GOLD to Material.GOLD_ORE,
+        OreTable.Ore.REDSTONE to Material.REDSTONE_ORE, OreTable.Ore.LAPIS to Material.LAPIS_ORE,
+        OreTable.Ore.DIAMOND to Material.DIAMOND_ORE,
+    ).mapValues { it.value.createBlockData() }
+    private val DEEPSLATE_ORES = mapOf(
+        OreTable.Ore.COAL to Material.DEEPSLATE_COAL_ORE, OreTable.Ore.IRON to Material.DEEPSLATE_IRON_ORE,
+        OreTable.Ore.COPPER to Material.DEEPSLATE_COPPER_ORE, OreTable.Ore.GOLD to Material.DEEPSLATE_GOLD_ORE,
+        OreTable.Ore.REDSTONE to Material.DEEPSLATE_REDSTONE_ORE, OreTable.Ore.LAPIS to Material.DEEPSLATE_LAPIS_ORE,
+        OreTable.Ore.DIAMOND to Material.DEEPSLATE_DIAMOND_ORE,
+    ).mapValues { it.value.createBlockData() }
     private val SHORT_GRASS = Material.SHORT_GRASS.createBlockData()
     private val FLOWERS = listOf(Material.DANDELION.createBlockData(), Material.POPPY.createBlockData())
 
@@ -47,7 +65,7 @@ object GenerateJob {
     fun computeChanges(
         grid: SurfaceGrid, plan: GeneratePlan, maxFillDepth: Int,
         reference: SurfaceGrid?, copyPlants: Boolean,
-        waterLevel: Int?, beachWidth: Int, seed: Long,
+        waterLevel: Int?, beachWidth: Int, seed: Long, fillOres: Boolean,
     ): ChangeSet {
         val changes = ChangeSet(grid.world.uid)
         val m = grid.margin
@@ -106,10 +124,13 @@ object GenerateJob {
                 for (i in 1..profile.fillerDepth) set(surface - i, profile.filler)
                 var y = surface - profile.fillerDepth - 1
                 val lowest = surface - maxFillDepth
-                while (y >= floor && y >= lowest && !grid.type(x, y, z).isSolid) {
-                    set(y, profile.deep)
+                // Fill down to real ground: air, water, plants, and trees or leaves that would end up buried.
+                while (y >= floor && y >= lowest && !SurfaceScanner.isTerrain(grid.type(x, y, z))) {
+                    set(y, if (fillOres) oreIn(profile.deep, x, y, z, seed) else profile.deep)
                     y--
                 }
+                // Raised ground: the old topsoil is buried now, and grass or paths don't grow in the dark.
+                if (y >= floor && y < surface - profile.fillerDepth && grid.type(x, y, z) in TOPSOIL) set(y, DIRT)
             }
         }
         return changes
@@ -150,6 +171,16 @@ object GenerateJob {
             }
         }
         return dist
+    }
+
+    /** Stone or deepslate fill gets vanilla-like ore veins; any other fill (sandstone, terracotta…) stays plain. */
+    private fun oreIn(rock: BlockData, x: Int, y: Int, z: Int, seed: Long): BlockData {
+        val ores = when (rock.material) {
+            Material.STONE -> STONE_ORES
+            Material.DEEPSLATE -> DEEPSLATE_ORES
+            else -> return rock
+        }
+        return OreTable.pick(x, y, z, seed)?.let { ores.getValue(it) } ?: rock
     }
 
     /** Sparse grass and the odd flower, roughly vanilla plains density; stable per position. */
@@ -198,7 +229,8 @@ object GenerateJob {
         if (!SurfaceScanner.isTerrain(grid.type(x, surface, z))) return null
         val top = grid.blockData(x, surface, z)
         if (surface - 1 < floor || !SurfaceScanner.isTerrain(grid.type(x, surface - 1, z))) {
-            return ColumnProfile(top, top, 0, top)
+            // Nothing to copy below (a cave right under the surface): soil under topsoil, then stone.
+            return if (top.material in TOPSOIL) ColumnProfile(top, DIRT, 3, STONE) else ColumnProfile(top, top, 0, STONE)
         }
         val filler = grid.blockData(x, surface - 1, z)
         var depth = 1

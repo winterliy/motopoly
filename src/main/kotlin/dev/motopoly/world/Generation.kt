@@ -25,7 +25,7 @@ data class Generation(
         /** Off the main thread: reads only snapshots. */
         fun design(
             grid: SurfaceGrid, reference: SurfaceGrid?, params: GenerateParams,
-            maxFillDepth: Int, copyPlants: Boolean, beachWidth: Int,
+            maxFillDepth: Int, copyPlants: Boolean, beachWidth: Int, fillOres: Boolean,
         ): Generation {
             val water = WaterInfo.of(grid)
             val boundary = grid.heights.copyOf()
@@ -45,7 +45,7 @@ data class Generation(
                 boundary, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, used, reference?.heights
             )
             val changes = GenerateJob.computeChanges(
-                grid, plan, maxFillDepth, reference, copyPlants, water.level, beachWidth, params.seed(),
+                grid, plan, maxFillDepth, reference, copyPlants, water.level, beachWidth, params.seed(), fillOres,
             )
             return Generation(plan, changes, used, water)
         }

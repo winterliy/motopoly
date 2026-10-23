@@ -215,7 +215,9 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             ?.let { SurfaceScanner.scan(region.copy(world = it), margin, plugin.async).thenApply<SurfaceGrid?> { g -> g } }
             ?: CompletableFuture.completedFuture(null)
         main.thenCombineAsync(ref, { grid, refGrid ->
-            Generation.design(grid, refGrid, params, settings.maxFillDepth, settings.copyPlants, settings.beachWidth)
+            Generation.design(
+                grid, refGrid, params, settings.maxFillDepth, settings.copyPlants, settings.beachWidth, settings.fillOres,
+            )
         }, plugin.async).whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 if (error != null) {
