@@ -1,6 +1,7 @@
 package dev.motopoly.command
 
 import dev.motopoly.MotopolyPlugin
+import dev.motopoly.Settings
 import dev.motopoly.msg
 import dev.motopoly.selection.BlockPoint
 import dev.motopoly.selection.Region
@@ -20,14 +21,15 @@ import org.bukkit.entity.Player
 import org.bukkit.persistence.PersistentDataType
 import java.util.UUID
 
-private const val MAX_EDGE = 64
+private const val MAX_SMOOTH = 64
+private const val BLUR_PASSES = 2
 
 class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: WandListener) : CommandExecutor, TabCompleter {
     private val busy = HashSet<UUID>()
-    private val edgeKey = NamespacedKey(plugin, "edge")
+    private val smoothKey = NamespacedKey(plugin, "smooth")
+    private val roughKey = NamespacedKey(plugin, "rough")
 
-    private val subcommands = listOf("help", "wand", "pos1", "pos2", "info", "generate", "gen", "edge", "undo", "reload")
-    private val generateKeys = listOf("height=", "rough=", "scale=", "edge=", "smooth=", "seed=")
+    private val subcommands = listOf("help", "wand", "pos1", "pos2", "info", "gen", "config", "undo", "reload")
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
         if (args.firstOrNull()?.lowercase() == "help") {
@@ -51,11 +53,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             "pos1" -> wand.setPoint(sender, 1, BlockPoint.of(sender.location))
             "pos2" -> wand.setPoint(sender, 2, BlockPoint.of(sender.location))
             "info" -> region(sender)?.let { info(sender, it) }
-            "generate", "gen" -> region(sender)?.let { region ->
-                val params = parseGenerate(sender, region, args.drop(1)) ?: return true
-                generate(sender, region, params)
-            }
-            "edge" -> edge(sender, args.getOrNull(1))
+            "gen", "generate" -> gen(sender, label, args.getOrNull(1))
+            "config" -> config(sender, label, args.getOrNull(1), args.getOrNull(2))
             "undo" -> undo(sender)
             else -> help(sender, label)
         }
@@ -65,47 +64,74 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private fun help(sender: CommandSender, label: String) {
         sender.msg(
             """
-            <gold>명령어</gold>
-            <yellow>/$label help</yellow> <gray>이 도움말 보기
-            <yellow>/$label wand</yellow> <gray>선택 도구 받기
-            <yellow>/$label pos1</yellow>, <yellow>pos2</yellow> <gray>현재 위치를 지점으로
-            <yellow>/$label info</yellow> <gray>선택 영역과 주변 지형 분석
-            <yellow>/$label gen</yellow> <gray>[height=<y|auto>] [rough=<n|auto>] [scale=<n>] [edge=<n>] [smooth=<n>] — 주변과 이어지는 땅 생성
-            <yellow>/$label edge</yellow> <gray>[<n>|reset] 가장자리 스무딩 폭 확인/설정
-            <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
-            <yellow>/$label reload</yellow> <gray>config.yml 다시 불러오기
+            <gold>사용 순서</gold>
+            <yellow>1.</yellow> <yellow>/$label pos1</yellow>, <yellow>/$label pos2</yellow> <gray>구역 지정 (또는 /$label wand 로 클릭)
+            <yellow>2.</yellow> <yellow>/$label gen <y></yellow> <gray>구역 땅을 Y 높이로 올리거나 내리고, 주변과 자연스럽게 이어요
+            <yellow>3.</yellow> <yellow>/$label config <smooth|rough> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
+            <yellow>4.</yellow> <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
+            <gray>기타: /$label info (지형 분석), /$label config (현재 설정 보기), /$label reload
             """.trimIndent()
         )
     }
 
-    /** Player's edge smoothing width, kept in their persistent data so it survives restarts. */
-    private fun edgeOf(player: Player): Int =
-        player.persistentDataContainer.get(edgeKey, PersistentDataType.INTEGER) ?: plugin.settings.defaultFeather
+    private fun smoothOf(player: Player): Int =
+        player.persistentDataContainer.get(smoothKey, PersistentDataType.INTEGER) ?: plugin.settings.defaultSmooth
 
-    private fun edge(player: Player, value: String?) {
-        when {
-            value == null -> player.msg("<white>가장자리 스무딩 폭: <aqua>${edgeOf(player)}</aqua>블록 <gray>(/mt edge <0~$MAX_EDGE>|reset)")
-            value.equals("reset", true) -> {
-                player.persistentDataContainer.remove(edgeKey)
-                player.msg("<green>가장자리 스무딩 폭을 기본값 <aqua>${plugin.settings.defaultFeather}</aqua>블록으로 되돌렸어요.")
-            }
-            else -> {
-                val n = value.toIntOrNull()?.takeIf { it in 0..MAX_EDGE } ?: run {
-                    player.msg("<red>0~$MAX_EDGE 사이 숫자를 입력해 주세요.")
-                    return
+    private fun roughOf(player: Player): Double =
+        player.persistentDataContainer.get(roughKey, PersistentDataType.DOUBLE) ?: plugin.settings.defaultRough
+
+    private fun roughText(rough: Double) = if (rough.isNaN()) "auto" else "%.1f".format(rough)
+
+    private fun config(player: Player, label: String, key: String?, value: String?) {
+        val pdc = player.persistentDataContainer
+        val s = plugin.settings
+        when (key?.lowercase()) {
+            null -> player.msg(
+                "<white>현재 설정: smooth <aqua>${smoothOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua> " +
+                    "<gray>(/$label config <smooth|rough> [값])"
+            )
+            "smooth" -> when {
+                value == null -> {
+                    pdc.remove(smoothKey)
+                    player.msg("<green>smooth를 기본값 <aqua>${s.defaultSmooth}</aqua>블록으로 되돌렸어요.")
                 }
-                player.persistentDataContainer.set(edgeKey, PersistentDataType.INTEGER, n)
-                val note = if (n == 0) " <gray>(기복과 목표 높이가 테두리부터 바로 적용돼요)"
-                           else " <gray>(테두리 ${n}블록에 걸쳐 주변 지형에서 서서히 바뀌어요)"
-                player.msg("<green>가장자리 스무딩 폭: <aqua>$n</aqua>블록$note")
+                else -> {
+                    val n = value.toIntOrNull()?.takeIf { it in 0..MAX_SMOOTH } ?: run {
+                        player.msg("<red>smooth는 0~$MAX_SMOOTH 사이 정수예요.")
+                        return
+                    }
+                    pdc.set(smoothKey, PersistentDataType.INTEGER, n)
+                    val note = if (n == 0) "테두리부터 바로 목표 높이가 돼요" else "테두리 ${n}블록에 걸쳐 주변 지형에서 목표 높이로 바뀌어요"
+                    player.msg("<green>smooth: <aqua>$n</aqua>블록 <gray>($note)")
+                }
             }
+            "rough" -> when {
+                value == null -> {
+                    pdc.remove(roughKey)
+                    player.msg("<green>rough를 기본값 <aqua>${roughText(s.defaultRough)}</aqua>(으)로 되돌렸어요.")
+                }
+                else -> {
+                    val r = Settings.parseRough(value)?.takeIf { it.isNaN() || it <= 16 } ?: run {
+                        player.msg("<red>rough는 auto 또는 0~16 사이 숫자예요.")
+                        return
+                    }
+                    pdc.set(roughKey, PersistentDataType.DOUBLE, r)
+                    val note = when {
+                        r.isNaN() -> "주변 지형에 맞춰 자동으로 정해요"
+                        r == 0.0 -> "기복 없는 완전 평면이에요"
+                        else -> "최대 ${roughText(r)}블록 높낮이가 생겨요"
+                    }
+                    player.msg("<green>rough: <aqua>${roughText(r)}</aqua> <gray>($note)")
+                }
+            }
+            else -> player.msg("<red>설정 항목은 smooth, rough 중 하나예요.")
         }
     }
 
     private fun region(player: Player): Region? {
         val region = plugin.selections.of(player.uniqueId).region(player.world)
         if (region == null) {
-            player.msg("<red>이 월드에서 두 지점을 먼저 찍어 주세요. <gray>(/mt wand)")
+            player.msg("<red>이 월드에서 두 지점을 먼저 찍어 주세요. <gray>(/mt pos1, /mt pos2)")
             return null
         }
         if (region.columns > plugin.settings.maxColumns) {
@@ -119,36 +145,21 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         return region
     }
 
-    private fun parseGenerate(player: Player, region: Region, args: List<String>): GenerateParams? {
-        val s = plugin.settings
-        var height: Int? = null
-        var rough = s.defaultRough
-        var scale = s.defaultScale
-        var edge = edgeOf(player)
-        var smooth = s.defaultSmooth
-        var seed = region.world.seed
-        for (arg in args) {
-            val (key, value) = arg.split('=', limit = 2).takeIf { it.size == 2 } ?: run {
-                player.msg("<red>'$arg'은(는) key=value 형식이 아니에요.")
-                return null
-            }
-            val ok = when (key.lowercase()) {
-                "height" -> value.equals("auto", true) || value.toIntOrNull()?.also { height = it } != null
-                "rough" -> if (value.equals("auto", true)) { rough = Double.NaN; true }
-                           else value.toDoubleOrNull()?.takeIf { it >= 0 }?.also { rough = it } != null
-                "scale" -> value.toDoubleOrNull()?.takeIf { it > 0 }?.also { scale = it } != null
-                "edge" -> value.toIntOrNull()?.takeIf { it in 0..MAX_EDGE }?.also { edge = it } != null
-                "smooth" -> value.toIntOrNull()?.takeIf { it in 0..10 }?.also { smooth = it } != null
-                "seed" -> value.toLongOrNull()?.also { seed = it } != null
-                else -> false
-            }
-            if (!ok) {
-                player.msg("<red>잘못된 옵션: $arg")
-                return null
-            }
+    private fun gen(player: Player, label: String, yArg: String?) {
+        val world = player.world
+        val minY = world.minHeight + 1
+        val maxY = world.maxHeight - 2
+        if (yArg == null) {
+            player.msg("<red>높이를 입력해 주세요: <yellow>/$label gen <y></yellow> <gray>(지금 서 있는 높이: ${player.location.blockY - 1})")
+            return
         }
-        val world = region.world
-        return GenerateParams(height, rough, scale, edge, smooth, seed, world.minHeight + 1, world.maxHeight - 2)
+        val y = yArg.toIntOrNull()?.takeIf { it in minY..maxY } ?: run {
+            player.msg("<red>y는 $minY~$maxY 사이 정수예요.")
+            return
+        }
+        val region = region(player) ?: return
+        val params = GenerateParams(y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, world.seed, minY, maxY)
+        generate(player, region, params)
     }
 
     private fun info(player: Player, region: Region) {
@@ -171,8 +182,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     """
                     <gold>지형 분석</gold> <gray>${region.width} x ${region.depth}
                     <white>주변</white> <gray>높이 ${around.min()}~${around.max()} (중앙값 ${around.median()}), 거칠기 ${"%.2f".format(around.roughness())} → <aqua>${around.describe()}</aqua>
-                    <white>안쪽(현재)</white> <gray>높이 ${inside.min()}~${inside.max()} — 생성할 때는 무시돼요
-                    <white>추천</white> <gray>/mt gen rough=${"%.1f".format(TerrainGenerator.autoRoughness(around))} <dark_gray>(평평하게: height=${around.median()} rough=0)
+                    <white>안쪽(현재)</white> <gray>높이 ${inside.min()}~${inside.max()} (중앙값 ${inside.median()})
+                    <white>추천</white> <gray>/mt gen ${around.median()} <dark_gray>(auto일 때 기복 ${"%.1f".format(TerrainGenerator.autoRoughness(around))}블록)
                     """.trimIndent()
                 )
             })
@@ -200,7 +211,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 val (plan, changes) = result
                 val target = plan.target()
                 player.msg(
-                    "<white>새 지표면 높이 <aqua>${target.min()}~${target.max()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>블록 " +
+                    "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
+                        "smooth <aqua>${params.edge()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua> " +
                         "<gray>(블록 변경 ${changes.size}개)"
                 )
                 GenerateJob.apply(plugin, changes, undo = false, blocksPerTick = settings.blocksPerTick,
@@ -238,20 +250,17 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     }
 
     override fun onTabComplete(sender: CommandSender, command: Command, label: String, args: Array<out String>): List<String> {
-        val last = args.lastOrNull() ?: return emptyList()
-        return when {
-            args.size == 1 -> subcommands.filter { it.startsWith(last.lowercase()) }
-            args.size == 2 && args[0].equals("edge", true) ->
-                listOf("0", "5", "10", "16", "reset").filter { it.startsWith(last.lowercase()) }
-            args[0].equals("generate", true) || args[0].equals("gen", true) -> {
-                val used = args.dropLast(1).map { it.substringBefore('=') + "=" }.toSet()
-                if (last.startsWith("height=") || last.startsWith("rough=")) {
-                    listOf(last.substringBefore('=') + "=auto").filter { it.startsWith(last) }
-                } else {
-                    generateKeys.filter { it !in used && it.startsWith(last.lowercase()) }
-                }
-            }
+        val last = args.lastOrNull()?.lowercase() ?: return emptyList()
+        val sub = args[0].lowercase()
+        val suggestions = when {
+            args.size == 1 -> subcommands
+            sub == "config" && args.size == 2 -> listOf("smooth", "rough")
+            sub == "config" && args.size == 3 && args[1].equals("smooth", true) -> listOf("0", "5", "10", "16")
+            sub == "config" && args.size == 3 && args[1].equals("rough", true) -> listOf("auto", "0", "1", "2")
+            (sub == "gen" || sub == "generate") && args.size == 2 && sender is Player ->
+                listOf((sender.location.blockY - 1).toString())
             else -> emptyList()
         }
+        return suggestions.filter { it.startsWith(last) }
     }
 }
