@@ -13,10 +13,13 @@ package dev.motopoly.terrain;
  *       edge, so slopes on one side fade naturally into the other.</li>
  *   <li><b>Target level.</b> If a base Y is given, the surface eases from the
  *       membrane at the edge to that level over the {@code edge} band.</li>
- *   <li><b>Natural detail.</b> Vanilla plains are the high-erosion case of the
- *       terrain density function: little offset, just low-amplitude octave
- *       noise. That noise is added here, modulated by a slower "erosion"
- *       noise, and faded in over the edge band so the edge still lines up.</li>
+ *   <li><b>Natural detail.</b> Preferably the real thing: the heightmap the
+ *       vanilla generator produces for these very coordinates, high-pass
+ *       filtered so only the small bumps remain (no mountains or valleys).
+ *       Without a reference, a stand-in: vanilla plains are the high-erosion
+ *       case of the density function, i.e. low-amplitude octave noise, so
+ *       that noise is used, modulated by a slower "erosion" noise. Either way
+ *       the detail fades in over the edge band so the edge still lines up.</li>
  *   <li>A light blur, then rounding to whole blocks.</li>
  * </ol>
  *
@@ -29,6 +32,9 @@ public final class TerrainGenerator {
     private static final double NOISE_GAIN = 1.6;
     private static final long EROSION_SALT = 0x5DEECE66DL;
     private static final double CONVERGED = 0.005;
+    // Vanilla relief keeps its natural size under rough=auto, within these bounds.
+    private static final double AUTO_RELIEF_MIN = 0.4;
+    private static final double AUTO_RELIEF_MAX = 2.5;
 
     private TerrainGenerator() {
     }
@@ -43,8 +49,20 @@ public final class TerrainGenerator {
      */
     public static GeneratePlan plan(int[] heights, int fullW, int fullD, int margin,
                                     int originX, int originZ, GenerateParams params) {
+        return plan(heights, fullW, fullD, margin, originX, originZ, params, null);
+    }
+
+    /**
+     * @param reference vanilla-generated surface Y over the same expanded grid,
+     *                  used as the source of natural detail; {@code null} falls back to noise
+     */
+    public static GeneratePlan plan(int[] heights, int fullW, int fullD, int margin,
+                                    int originX, int originZ, GenerateParams params, int[] reference) {
         if (heights.length != fullW * fullD) {
             throw new IllegalArgumentException("heights must be fullW*fullD");
+        }
+        if (reference != null && reference.length != fullW * fullD) {
+            throw new IllegalArgumentException("reference must be fullW*fullD");
         }
         int w = fullW - 2 * margin;
         int d = fullD - 2 * margin;
@@ -53,12 +71,39 @@ public final class TerrainGenerator {
         }
 
         TerrainStats around = TerrainStats.ofBand(heights, fullW, fullD, margin);
-        double roughness = Double.isNaN(params.roughness()) ? autoRoughness(around) : params.roughness();
+
+        // Unit-scale detail per selection cell, roughly in [-1, 1], times its amplitude.
+        double[] detail = new double[w * d];
+        double roughness;
+        boolean vanilla = false;
+        double[] relief = reference == null ? null : relief(reference, fullW, fullD, reliefRadius(params.scale()));
+        double reliefSize = relief == null ? 0 : innerPercentile95(relief, fullW, fullD, margin);
+        if (relief != null && reliefSize > 1e-6) {
+            vanilla = true;
+            roughness = Double.isNaN(params.roughness())
+                    ? clamp(reliefSize, AUTO_RELIEF_MIN, AUTO_RELIEF_MAX) : params.roughness();
+            for (int z = 0; z < d; z++) {
+                for (int x = 0; x < w; x++) {
+                    double r = relief[(z + margin) * fullW + (x + margin)] / reliefSize;
+                    detail[z * w + x] = roughness * clamp(r, -1.5, 1.5);
+                }
+            }
+        } else {
+            roughness = Double.isNaN(params.roughness()) ? autoRoughness(around) : params.roughness();
+            OctaveNoise noise = new OctaveNoise(params.seed(), 4);
+            OctaveNoise erosion = new OctaveNoise(params.seed() ^ EROSION_SALT, 2);
+            for (int z = 0; z < d; z++) {
+                for (int x = 0; x < w; x++) {
+                    int wx = originX + margin + x;
+                    int wz = originZ + margin + z;
+                    double n = clamp(noise.sample(wx / params.scale(), wz / params.scale()) * NOISE_GAIN, -1, 1);
+                    double e = erosion.sample(wx / (params.scale() * 4), wz / (params.scale() * 4));
+                    detail[z * w + x] = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5)) * n;
+                }
+            }
+        }
 
         double[] field = membrane(heights, fullW, fullD, margin, w, d);
-
-        OctaveNoise detail = new OctaveNoise(params.seed(), 4);
-        OctaveNoise erosion = new OctaveNoise(params.seed() ^ EROSION_SALT, 2);
         for (int z = 0; z < d; z++) {
             for (int x = 0; x < w; x++) {
                 int fi = (z + margin) * fullW + (x + margin);
@@ -67,12 +112,7 @@ public final class TerrainGenerator {
                 if (params.baseY() != null) {
                     h += (params.baseY() - h) * t;
                 }
-                int wx = originX + margin + x;
-                int wz = originZ + margin + z;
-                double n = clamp(detail.sample(wx / params.scale(), wz / params.scale()) * NOISE_GAIN, -1, 1);
-                double e = erosion.sample(wx / (params.scale() * 4), wz / (params.scale() * 4));
-                double amp = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5));
-                field[fi] = h + amp * n * t;
+                field[fi] = h + detail[z * w + x] * t;
             }
         }
 
@@ -87,7 +127,68 @@ public final class TerrainGenerator {
                 target[z * w + x] = Math.max(params.minY(), Math.min(params.maxY(), y));
             }
         }
-        return new GeneratePlan(target, roughness, around);
+        return new GeneratePlan(target, roughness, around, vanilla);
+    }
+
+    /** Features wider than about this many blocks count as hills, not bumps. */
+    static int reliefRadius(double scale) {
+        return (int) Math.max(4, Math.min(24, Math.round(scale / 4)));
+    }
+
+    /**
+     * High-pass filter: the heightmap minus a blurred copy of itself. What is
+     * left are the small natural bumps; mountains, valleys and slopes cancel out.
+     */
+    static double[] relief(int[] heights, int width, int depth, int radius) {
+        double[] smooth = new double[heights.length];
+        for (int i = 0; i < heights.length; i++) smooth[i] = heights[i];
+        // Three box blurs approximate a Gaussian.
+        for (int pass = 0; pass < 3; pass++) {
+            smooth = boxBlur(smooth, width, depth, radius, true);
+            smooth = boxBlur(smooth, width, depth, radius, false);
+        }
+        double[] out = new double[heights.length];
+        for (int i = 0; i < out.length; i++) out[i] = heights[i] - smooth[i];
+        return out;
+    }
+
+    private static double[] boxBlur(double[] src, int width, int depth, int radius, boolean horizontal) {
+        double[] out = new double[src.length];
+        int lines = horizontal ? depth : width;
+        int len = horizontal ? width : depth;
+        for (int line = 0; line < lines; line++) {
+            double sum = 0;
+            // Running sum with clamped edges.
+            for (int k = -radius; k <= radius; k++) sum += src[at(line, clampIndex(k, len), width, horizontal)];
+            for (int i = 0; i < len; i++) {
+                out[at(line, i, width, horizontal)] = sum / (2 * radius + 1);
+                sum += src[at(line, clampIndex(i + radius + 1, len), width, horizontal)];
+                sum -= src[at(line, clampIndex(i - radius, len), width, horizontal)];
+            }
+        }
+        return out;
+    }
+
+    private static int at(int line, int i, int width, boolean horizontal) {
+        return horizontal ? line * width + i : i * width + line;
+    }
+
+    private static int clampIndex(int i, int len) {
+        return i < 0 ? 0 : (i >= len ? len - 1 : i);
+    }
+
+    /** 95th percentile of |values| over the selection cells: the relief's typical peak size. */
+    static double innerPercentile95(double[] values, int fullW, int fullD, int margin) {
+        int w = fullW - 2 * margin;
+        int d = fullD - 2 * margin;
+        double[] abs = new double[w * d];
+        for (int z = 0; z < d; z++) {
+            for (int x = 0; x < w; x++) {
+                abs[z * w + x] = Math.abs(values[(z + margin) * fullW + (x + margin)]);
+            }
+        }
+        java.util.Arrays.sort(abs);
+        return abs[Math.min(abs.length - 1, (int) Math.floor(abs.length * 0.95))];
     }
 
     /**

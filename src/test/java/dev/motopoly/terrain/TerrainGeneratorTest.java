@@ -111,6 +111,55 @@ class TerrainGeneratorTest {
     }
 
     @Test
+    void reliefRemovesSlopesAndKeepsBumps() {
+        int w = 80, d = 80;
+        // A steep ramp (should vanish) plus 1-block bumps every 6 blocks (should stay).
+        int[] h = grid(w, d, (x, z) -> 60 + x + ((x / 3 + z / 3) % 2 == 0 ? 1 : 0));
+        double[] relief = TerrainGenerator.relief(h, w, d, 12);
+        for (int z = 30; z < 50; z++) {
+            for (int x = 30; x < 50; x++) {
+                double r = relief[z * w + x];
+                assertTrue(Math.abs(r) < 1.0, "slope leaked into relief: " + r);
+            }
+        }
+        double spread = 0;
+        for (int x = 30; x < 50; x++) spread = Math.max(spread, Math.abs(relief[40 * w + x]));
+        assertTrue(spread > 0.3, "bumps were flattened away");
+    }
+
+    @Test
+    void vanillaReferenceDrivesDetail() {
+        int w = 48, d = 48, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] around = grid(fullW, fullD, (x, z) -> 70);
+        // Reference terrain: a mountain slope with small bumps on it.
+        int[] reference = grid(fullW, fullD, (x, z) -> 90 + x / 2 + ((x * 7 + z * 13) % 5 == 0 ? 2 : 0));
+        GeneratePlan plan = TerrainGenerator.plan(around, fullW, fullD, MARGIN, 0, 0, params(70, Double.NaN, 4, 0), reference);
+        assertTrue(plan.vanillaRelief());
+        // The mountain itself must not come through: the centre stays near the target.
+        for (int y : plan.target()) {
+            assertTrue(Math.abs(y - 70) <= 4, "y=" + y);
+        }
+        assertTrue(java.util.Arrays.stream(plan.target()).distinct().count() > 1, "no detail at all");
+    }
+
+    @Test
+    void roughZeroIgnoresReference() {
+        int w = 30, d = 30, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] around = grid(fullW, fullD, (x, z) -> 64);
+        int[] reference = grid(fullW, fullD, (x, z) -> 64 + (x * z) % 3);
+        GeneratePlan plan = TerrainGenerator.plan(around, fullW, fullD, MARGIN, 0, 0, params(64, 0, 4, 2), reference);
+        for (int y : plan.target()) assertEquals(64, y);
+    }
+
+    @Test
+    void flatReferenceFallsBackToNoise() {
+        int w = 30, d = 30, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] flat = grid(fullW, fullD, (x, z) -> 64);
+        GeneratePlan plan = TerrainGenerator.plan(flat, fullW, fullD, MARGIN, 0, 0, params(64, 1, 4, 2), flat);
+        assertFalse(plan.vanillaRelief());
+    }
+
+    @Test
     void autoRoughnessTracksSurroundings() {
         assertEquals(0.4, TerrainGenerator.autoRoughness(new TerrainStats(60, 62, 61, 61, 0.5, 0.0)), 1e-9);
         assertEquals(2.0, TerrainGenerator.autoRoughness(new TerrainStats(60, 120, 90, 90, 20, 8.0)), 1e-9);

@@ -17,14 +17,19 @@ object GenerateJob {
 
     /**
      * Works out every block edit for [plan]. Reads only from the snapshots in
-     * [grid], so it is safe to call off the main thread.
+     * [grid] and [reference], so it is safe to call off the main thread.
      *
      * Each column: everything above the new surface is removed, the surface
-     * gets the material stack of the nearest column outside the selection, and
-     * any air or water underneath is filled down to solid ground (at most
-     * [maxFillDepth] blocks).
+     * gets a material stack, and any air or water underneath is filled down to
+     * solid ground (at most [maxFillDepth] blocks). The material stack and the
+     * plants come from the vanilla [reference] column when it is dry land
+     * there; otherwise the stack is copied from the nearest column outside the
+     * selection and no plants are added.
      */
-    fun computeChanges(grid: SurfaceGrid, plan: GeneratePlan, maxFillDepth: Int): ChangeSet {
+    fun computeChanges(
+        grid: SurfaceGrid, plan: GeneratePlan, maxFillDepth: Int,
+        reference: SurfaceGrid?, copyPlants: Boolean,
+    ): ChangeSet {
         val changes = ChangeSet(grid.world.uid)
         val m = grid.margin
         val w = grid.width - 2 * m
@@ -39,18 +44,29 @@ object GenerateJob {
                 val z = grid.originZ + m + iz
                 val surface = plan.target()[iz * w + ix]
 
-                val (bx, bz) = nearestOutside(ix, iz, w, d)
-                val boundaryX = grid.originX + m + bx
-                val boundaryZ = grid.originZ + m + bz
-                val profile = profiles.getOrPut(grid.index(boundaryX, boundaryZ)) {
-                    profileOf(grid, boundaryX, grid.heights[grid.index(boundaryX, boundaryZ)], boundaryZ)
+                val gi = grid.index(x, z)
+                // Same coordinates in the twin world; dry land there means its column is usable.
+                val refTop = reference?.heights?.get(gi)
+                val vanilla = refTop != null && reference.surface[gi] == refTop
+                val profile = if (vanilla) {
+                    profileOf(reference, x, refTop, z)
+                } else {
+                    val (bx, bz) = nearestOutside(ix, iz, w, d)
+                    val boundaryX = grid.originX + m + bx
+                    val boundaryZ = grid.originZ + m + bz
+                    profiles.getOrPut(grid.index(boundaryX, boundaryZ)) {
+                        profileOf(grid, boundaryX, grid.heights[grid.index(boundaryX, boundaryZ)], boundaryZ)
+                    }
                 }
+                val plants = if (vanilla && copyPlants) plantsAbove(reference, x, refTop, z) else emptyList()
 
                 fun set(y: Int, data: BlockData) {
                     if (y in floor..ceiling) changes.add(x, y, z, grid.blockData(x, y, z), data)
                 }
 
-                for (y in surface + 1..grid.skyHeights[grid.index(x, z)]) set(y, AIR)
+                for (y in surface + 1..maxOf(grid.skyHeights[gi], surface + plants.size)) {
+                    set(y, plants.getOrNull(y - surface - 1) ?: AIR)
+                }
                 set(surface, profile.top)
                 for (i in 1..profile.fillerDepth) set(surface - i, profile.filler)
                 var y = surface - profile.fillerDepth - 1
@@ -76,6 +92,18 @@ object GenerateJob {
             toTop -> ix to -1
             else -> ix to d
         }
+    }
+
+    /** Grass, flowers, ferns, snow layers… sitting on the terrain (at most two blocks, e.g. tall grass). */
+    private fun plantsAbove(grid: SurfaceGrid, x: Int, surface: Int, z: Int): List<BlockData> {
+        val ceiling = grid.world.maxHeight - 1
+        val plants = ArrayList<BlockData>(2)
+        for (y in surface + 1..minOf(surface + 2, ceiling)) {
+            val type = grid.type(x, y, z)
+            if (type.isAir || type.isSolid || SurfaceScanner.isLiquid(type)) break
+            plants += grid.blockData(x, y, z)
+        }
+        return plants
     }
 
     private fun profileOf(grid: SurfaceGrid, x: Int, surface: Int, z: Int): ColumnProfile {

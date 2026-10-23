@@ -13,6 +13,9 @@ data class Settings(
     /** Undulation in blocks, NaN = auto; players override it with /mt config rough. */
     val defaultRough: Double,
     val scale: Double,
+    /** Borrow topography, materials and plants from a same-seed twin world. */
+    val referenceTerrain: Boolean,
+    val copyPlants: Boolean,
 ) {
     companion object {
         fun load(config: FileConfiguration) = Settings(
@@ -24,6 +27,8 @@ data class Settings(
             defaultSmooth = config.getInt("defaults.smooth", 10).coerceIn(0, 64),
             defaultRough = parseRough(config.getString("defaults.rough", "auto")!!) ?: Double.NaN,
             scale = config.getDouble("scale", 48.0).coerceAtLeast(1.0),
+            referenceTerrain = config.getBoolean("reference-terrain", true),
+            copyPlants = config.getBoolean("copy-plants", true),
         )
 
         /** "auto" → NaN, a non-negative number → itself, anything else → null. */

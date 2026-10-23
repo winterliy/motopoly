@@ -3,6 +3,7 @@ package dev.motopoly
 import dev.motopoly.command.MotopolyCommand
 import dev.motopoly.selection.SelectionManager
 import dev.motopoly.selection.WandListener
+import dev.motopoly.world.ReferenceWorlds
 import dev.motopoly.world.UndoHistory
 import net.kyori.adventure.text.minimessage.MiniMessage
 import org.bukkit.Bukkit
@@ -20,6 +21,7 @@ class MotopolyPlugin : JavaPlugin() {
     lateinit var history: UndoHistory
         private set
     val selections = SelectionManager()
+    val references by lazy { ReferenceWorlds(slF4JLogger) }
     val async = Executor { Bukkit.getScheduler().runTaskAsynchronously(this, it) }
 
     override fun onEnable() {

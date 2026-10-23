@@ -10,6 +10,8 @@ import dev.motopoly.terrain.GenerateParams
 import dev.motopoly.terrain.TerrainGenerator
 import dev.motopoly.terrain.TerrainStats
 import dev.motopoly.world.GenerateJob
+import dev.motopoly.world.ReferenceWorlds
+import dev.motopoly.world.SurfaceGrid
 import dev.motopoly.world.SurfaceScanner
 import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
@@ -20,6 +22,7 @@ import org.bukkit.command.TabCompleter
 import org.bukkit.entity.Player
 import org.bukkit.persistence.PersistentDataType
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 
 private const val MAX_SMOOTH = 64
 private const val BLUR_PASSES = 2
@@ -192,15 +195,28 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
 
     private fun generate(player: Player, region: Region, params: GenerateParams) {
         busy += player.uniqueId
-        player.msg("<gray>주변 지형을 분석하고 땅을 설계하는 중...")
         val settings = plugin.settings
-        SurfaceScanner.scan(region, settings.analysisMargin, plugin.async).thenApply { grid ->
+        val refWorld = if (settings.referenceTerrain) {
+            if (Bukkit.getWorld(ReferenceWorlds.PREFIX + region.world.name) == null) {
+                player.msg("<gray>바닐라 참조 월드를 준비하는 중... (처음 한 번만)")
+            }
+            plugin.references.of(region.world)
+        } else {
+            null
+        }
+        player.msg("<gray>주변 지형을 분석하고 땅을 설계하는 중...")
+        val margin = settings.analysisMargin
+        val main = SurfaceScanner.scan(region, margin, plugin.async)
+        val ref: CompletableFuture<SurfaceGrid?> = refWorld
+            ?.let { SurfaceScanner.scan(region.copy(world = it), margin, plugin.async).thenApply<SurfaceGrid?> { g -> g } }
+            ?: CompletableFuture.completedFuture(null)
+        main.thenCombineAsync(ref, { grid, refGrid ->
             // Water around the selection counts at its surface, so new land meets it like a shore.
             val plan = TerrainGenerator.plan(
-                grid.surface, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params
+                grid.surface, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, refGrid?.heights
             )
-            plan to GenerateJob.computeChanges(grid, plan, settings.maxFillDepth)
-        }.whenComplete { result, error ->
+            plan to GenerateJob.computeChanges(grid, plan, settings.maxFillDepth, refGrid, settings.copyPlants)
+        }, plugin.async).whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 if (error != null) {
                     busy -= player.uniqueId
@@ -212,7 +228,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 val target = plan.target()
                 player.msg(
                     "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
-                        "smooth <aqua>${params.edge()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua> " +
+                        "smooth <aqua>${params.edge()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
+                        (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ") +
                         "<gray>(블록 변경 ${changes.size}개)"
                 )
                 GenerateJob.apply(plugin, changes, undo = false, blocksPerTick = settings.blocksPerTick,
