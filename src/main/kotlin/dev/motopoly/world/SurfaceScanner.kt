@@ -22,7 +22,9 @@ class SurfaceGrid(
     val margin: Int,
     /** Y of the topmost terrain block (trees, plants and water skipped). */
     val heights: IntArray,
-    /** Y of the topmost non-air block, trees and water included. */
+    /** Like [heights], but stops at the water surface: what a newcomer's ground should meet. */
+    val surface: IntArray,
+    /** Y of the topmost non-air block of any kind: buildings, trees, water. */
     val skyHeights: IntArray,
     private val snapshots: Map<Long, ChunkSnapshot>,
 ) {
@@ -51,10 +53,16 @@ object SurfaceScanner {
         Material.BEE_NEST, Material.MANGROVE_ROOTS, Material.MUDDY_MANGROVE_ROOTS,
         Material.POINTED_DRIPSTONE, Material.CHORUS_PLANT, Material.CHORUS_FLOWER,
     )
+    private val LIQUID = setOf(
+        Material.WATER, Material.LAVA, Material.BUBBLE_COLUMN,
+        Material.KELP, Material.KELP_PLANT, Material.SEAGRASS, Material.TALL_SEAGRASS,
+    )
 
-    /** Ground the flattener should treat as the land surface. */
+    /** Ground the generator should treat as the land surface. */
     fun isTerrain(type: Material) =
         type.isSolid && type !in NON_TERRAIN && !Tag.LOGS.isTagged(type) && !Tag.LEAVES.isTagged(type)
+
+    fun isLiquid(type: Material) = type in LIQUID
 
     fun chunkKey(cx: Int, cz: Int) = (cx.toLong() shl 32) or (cz.toLong() and 0xffffffffL)
 
@@ -90,6 +98,7 @@ object SurfaceScanner {
         val width = maxX - minX + 1
         val depth = maxZ - minZ + 1
         val heights = IntArray(width * depth)
+        val surface = IntArray(width * depth)
         val sky = IntArray(width * depth)
         val floor = world.minHeight
 
@@ -98,14 +107,33 @@ object SurfaceScanner {
                 val snap = snapshots.getValue(chunkKey(x shr 4, z shr 4))
                 val lx = x and 15
                 val lz = z and 15
-                val top = snap.getHighestBlockYAt(lx, lz)
+                val top = topNonAir(snap, lx, lz, world)
                 var y = top
-                while (y > floor && !isTerrain(snap.getBlockType(lx, y, lz))) y--
+                var water = Int.MIN_VALUE
+                while (y > floor) {
+                    val type = snap.getBlockType(lx, y, lz)
+                    if (isTerrain(type)) break
+                    if (water == Int.MIN_VALUE && isLiquid(type)) water = y
+                    y--
+                }
                 val i = (z - minZ) * width + (x - minX)
                 heights[i] = y
+                surface[i] = maxOf(y, water)
                 sky[i] = maxOf(top, y)
             }
         }
-        return SurfaceGrid(world, minX, minZ, width, depth, margin, heights, sky, snapshots)
+        return SurfaceGrid(world, minX, minZ, width, depth, margin, heights, surface, sky, snapshots)
+    }
+
+    /** Highest non-air block in a column, skipping empty sections; the heightmap misses torches, glass panes and the like. */
+    private fun topNonAir(snap: ChunkSnapshot, lx: Int, lz: Int, world: World): Int {
+        val minSection = world.minHeight shr 4
+        for (section in ((world.maxHeight - 1) shr 4) downTo minSection) {
+            if (snap.isSectionEmpty(section - minSection)) continue
+            for (y in (section shl 4) + 15 downTo (section shl 4)) {
+                if (!snap.getBlockType(lx, y, lz).isAir) return y
+            }
+        }
+        return world.minHeight
     }
 }

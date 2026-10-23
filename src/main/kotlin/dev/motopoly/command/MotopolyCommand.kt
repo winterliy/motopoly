@@ -5,10 +5,10 @@ import dev.motopoly.msg
 import dev.motopoly.selection.BlockPoint
 import dev.motopoly.selection.Region
 import dev.motopoly.selection.WandListener
-import dev.motopoly.terrain.FlattenParams
-import dev.motopoly.terrain.FlattenPlanner
+import dev.motopoly.terrain.GenerateParams
+import dev.motopoly.terrain.TerrainGenerator
 import dev.motopoly.terrain.TerrainStats
-import dev.motopoly.world.FlattenJob
+import dev.motopoly.world.GenerateJob
 import dev.motopoly.world.SurfaceScanner
 import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
@@ -26,8 +26,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private val busy = HashSet<UUID>()
     private val edgeKey = NamespacedKey(plugin, "edge")
 
-    private val subcommands = listOf("help", "wand", "pos1", "pos2", "info", "flatten", "edge", "undo", "reload")
-    private val flattenKeys = listOf("height=", "rough=", "scale=", "feather=", "smooth=", "trees=", "seed=")
+    private val subcommands = listOf("help", "wand", "pos1", "pos2", "info", "generate", "gen", "edge", "undo", "reload")
+    private val generateKeys = listOf("height=", "rough=", "scale=", "edge=", "smooth=", "seed=")
 
     override fun onCommand(sender: CommandSender, command: Command, label: String, args: Array<out String>): Boolean {
         if (args.firstOrNull()?.lowercase() == "help") {
@@ -51,9 +51,9 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             "pos1" -> wand.setPoint(sender, 1, BlockPoint.of(sender.location))
             "pos2" -> wand.setPoint(sender, 2, BlockPoint.of(sender.location))
             "info" -> region(sender)?.let { info(sender, it) }
-            "flatten" -> region(sender)?.let { region ->
-                val params = parseFlatten(sender, region, args.drop(1)) ?: return true
-                flatten(sender, region, params.first, params.second)
+            "generate", "gen" -> region(sender)?.let { region ->
+                val params = parseGenerate(sender, region, args.drop(1)) ?: return true
+                generate(sender, region, params)
             }
             "edge" -> edge(sender, args.getOrNull(1))
             "undo" -> undo(sender)
@@ -69,8 +69,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             <yellow>/$label help</yellow> <gray>이 도움말 보기
             <yellow>/$label wand</yellow> <gray>선택 도구 받기
             <yellow>/$label pos1</yellow>, <yellow>pos2</yellow> <gray>현재 위치를 지점으로
-            <yellow>/$label info</yellow> <gray>선택 영역 지형 분석
-            <yellow>/$label flatten</yellow> <gray>[height=<y|auto>] [rough=<n|auto>] [scale=<n>] [feather=<n>] [smooth=<n>] [trees=clear|keep]
+            <yellow>/$label info</yellow> <gray>선택 영역과 주변 지형 분석
+            <yellow>/$label gen</yellow> <gray>[height=<y|auto>] [rough=<n|auto>] [scale=<n>] [edge=<n>] [smooth=<n>] — 주변과 이어지는 땅 생성
             <yellow>/$label edge</yellow> <gray>[<n>|reset] 가장자리 스무딩 폭 확인/설정
             <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
             <yellow>/$label reload</yellow> <gray>config.yml 다시 불러오기
@@ -95,7 +95,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     return
                 }
                 player.persistentDataContainer.set(edgeKey, PersistentDataType.INTEGER, n)
-                val note = if (n == 0) " <gray>(경계가 각지게 끊겨요)" else " <gray>(영역 테두리 ${n}블록이 주변 지형으로 이어지는 경사가 돼요)"
+                val note = if (n == 0) " <gray>(기복과 목표 높이가 테두리부터 바로 적용돼요)"
+                           else " <gray>(테두리 ${n}블록에 걸쳐 주변 지형에서 서서히 바뀌어요)"
                 player.msg("<green>가장자리 스무딩 폭: <aqua>$n</aqua>블록$note")
             }
         }
@@ -118,14 +119,13 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         return region
     }
 
-    private fun parseFlatten(player: Player, region: Region, args: List<String>): Pair<FlattenParams, Boolean>? {
+    private fun parseGenerate(player: Player, region: Region, args: List<String>): GenerateParams? {
         val s = plugin.settings
         var height: Int? = null
         var rough = s.defaultRough
         var scale = s.defaultScale
-        var feather = edgeOf(player)
+        var edge = edgeOf(player)
         var smooth = s.defaultSmooth
-        var clearTrees = s.defaultClearTrees
         var seed = region.world.seed
         for (arg in args) {
             val (key, value) = arg.split('=', limit = 2).takeIf { it.size == 2 } ?: run {
@@ -137,13 +137,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 "rough" -> if (value.equals("auto", true)) { rough = Double.NaN; true }
                            else value.toDoubleOrNull()?.takeIf { it >= 0 }?.also { rough = it } != null
                 "scale" -> value.toDoubleOrNull()?.takeIf { it > 0 }?.also { scale = it } != null
-                "feather" -> value.toIntOrNull()?.takeIf { it >= 0 }?.also { feather = it } != null
+                "edge" -> value.toIntOrNull()?.takeIf { it in 0..MAX_EDGE }?.also { edge = it } != null
                 "smooth" -> value.toIntOrNull()?.takeIf { it in 0..10 }?.also { smooth = it } != null
-                "trees" -> when (value.lowercase()) {
-                    "clear" -> { clearTrees = true; true }
-                    "keep" -> { clearTrees = false; true }
-                    else -> false
-                }
                 "seed" -> value.toLongOrNull()?.also { seed = it } != null
                 else -> false
             }
@@ -153,7 +148,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             }
         }
         val world = region.world
-        return FlattenParams(height, rough, scale, feather, smooth, seed, world.minHeight + 1, world.maxHeight - 2) to clearTrees
+        return GenerateParams(height, rough, scale, edge, smooth, seed, world.minHeight + 1, world.maxHeight - 2)
     }
 
     private fun info(player: Player, region: Region) {
@@ -162,7 +157,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         SurfaceScanner.scan(region, plugin.settings.analysisMargin, plugin.async).thenApply { grid ->
             val m = grid.margin
             TerrainStats.of(grid.innerHeights(), grid.width - 2 * m, grid.depth - 2 * m) to
-                TerrainStats.of(grid.heights, grid.width, grid.depth)
+                TerrainStats.ofBand(grid.surface, grid.width, grid.depth, m)
         }.whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 busy -= player.uniqueId
@@ -175,43 +170,45 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 player.msg(
                     """
                     <gold>지형 분석</gold> <gray>${region.width} x ${region.depth}
-                    <white>높이</white> <gray>최저 ${inside.min()} / 최고 ${inside.max()} / 중앙값 ${inside.median()} / 표준편차 ${"%.2f".format(inside.stdDev())}
-                    <white>거칠기</white> <gray>${"%.2f".format(inside.roughness())} → <aqua>${inside.describe()}</aqua> <gray>(주변 포함: ${around.describe()})
-                    <white>추천</white> <gray>/mt flatten height=${inside.median()} rough=${"%.1f".format(FlattenPlanner.autoRoughness(around))}
+                    <white>주변</white> <gray>높이 ${around.min()}~${around.max()} (중앙값 ${around.median()}), 거칠기 ${"%.2f".format(around.roughness())} → <aqua>${around.describe()}</aqua>
+                    <white>안쪽(현재)</white> <gray>높이 ${inside.min()}~${inside.max()} — 생성할 때는 무시돼요
+                    <white>추천</white> <gray>/mt gen rough=${"%.1f".format(TerrainGenerator.autoRoughness(around))} <dark_gray>(평평하게: height=${around.median()} rough=0)
                     """.trimIndent()
                 )
             })
         }
     }
 
-    private fun flatten(player: Player, region: Region, params: FlattenParams, clearTrees: Boolean) {
+    private fun generate(player: Player, region: Region, params: GenerateParams) {
         busy += player.uniqueId
-        player.msg("<gray>지형을 분석하고 평지를 설계하는 중...")
+        player.msg("<gray>주변 지형을 분석하고 땅을 설계하는 중...")
         val settings = plugin.settings
         SurfaceScanner.scan(region, settings.analysisMargin, plugin.async).thenApply { grid ->
-            val plan = FlattenPlanner.plan(
-                grid.heights, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params
+            // Water around the selection counts at its surface, so new land meets it like a shore.
+            val plan = TerrainGenerator.plan(
+                grid.surface, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params
             )
-            plan to FlattenJob.computeChanges(grid, plan, clearTrees)
+            plan to GenerateJob.computeChanges(grid, plan, settings.maxFillDepth)
         }.whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 if (error != null) {
                     busy -= player.uniqueId
-                    player.msg("<red>설계 실패: ${error.cause?.message ?: error.message}")
-                    plugin.slF4JLogger.warn("flatten failed", error)
+                    player.msg("<red>생성 실패: ${error.cause?.message ?: error.message}")
+                    plugin.slF4JLogger.warn("generate failed", error)
                     return@Runnable
                 }
                 val (plan, changes) = result
+                val target = plan.target()
                 player.msg(
-                    "<white>기준 높이 <aqua>${plan.baseY()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>블록 " +
-                        "<gray>(깎기 ${plan.cut()} / 채우기 ${plan.fill()}, 블록 변경 ${changes.size}개)"
+                    "<white>새 지표면 높이 <aqua>${target.min()}~${target.max()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>블록 " +
+                        "<gray>(블록 변경 ${changes.size}개)"
                 )
-                FlattenJob.apply(plugin, changes, undo = false, blocksPerTick = settings.blocksPerTick,
+                GenerateJob.apply(plugin, changes, undo = false, blocksPerTick = settings.blocksPerTick,
                     onProgress = { done, total -> player.msg("<gray>적용 중... ${done * 100 / total}%") },
                     onDone = {
                         busy -= player.uniqueId
                         plugin.history.push(player.uniqueId, changes)
-                        player.msg("<green>평탄화 완료! <gray>되돌리려면 /mt undo")
+                        player.msg("<green>땅 생성 완료! <gray>되돌리려면 /mt undo")
                     })
             })
         }
@@ -232,7 +229,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             return
         }
         busy += player.uniqueId
-        FlattenJob.apply(plugin, changes, undo = true, blocksPerTick = plugin.settings.blocksPerTick,
+        GenerateJob.apply(plugin, changes, undo = true, blocksPerTick = plugin.settings.blocksPerTick,
             onProgress = { done, total -> player.msg("<gray>되돌리는 중... ${done * 100 / total}%") },
             onDone = {
                 busy -= player.uniqueId
@@ -246,13 +243,12 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             args.size == 1 -> subcommands.filter { it.startsWith(last.lowercase()) }
             args.size == 2 && args[0].equals("edge", true) ->
                 listOf("0", "5", "10", "16", "reset").filter { it.startsWith(last.lowercase()) }
-            args[0].equals("flatten", true) -> {
+            args[0].equals("generate", true) || args[0].equals("gen", true) -> {
                 val used = args.dropLast(1).map { it.substringBefore('=') + "=" }.toSet()
-                when {
-                    last.startsWith("trees=") -> listOf("trees=clear", "trees=keep").filter { it.startsWith(last) }
-                    last.startsWith("height=") || last.startsWith("rough=") ->
-                        listOf(last.substringBefore('=') + "=auto").filter { it.startsWith(last) }
-                    else -> flattenKeys.filter { it !in used && it.startsWith(last.lowercase()) }
+                if (last.startsWith("height=") || last.startsWith("rough=")) {
+                    listOf(last.substringBefore('=') + "=auto").filter { it.startsWith(last) }
+                } else {
+                    generateKeys.filter { it !in used && it.startsWith(last.lowercase()) }
                 }
             }
             else -> emptyList()

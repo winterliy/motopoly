@@ -2,14 +2,14 @@ name: Motopoly
 version: '${version}'
 main: dev.motopoly.MotopolyPlugin
 api-version: '26.3'
-description: 영역을 골라 바닐라 지형처럼 자연스러운 평지로 다듬는 건축용 플러그인
+description: 선택 구역에 주변 지형과 자연스럽게 이어지는 땅을 생성하는 건축용 플러그인
 libraries:
   - org.jetbrains.kotlin:kotlin-stdlib:${kotlinVersion}
 
 commands:
   motopoly:
-    description: Motopoly 평탄화 명령어
-    usage: /<command> <wand|pos1|pos2|info|flatten|undo|reload>
+    description: Motopoly 땅 생성 명령어
+    usage: /<command> <help|wand|pos1|pos2|info|gen|edge|undo|reload>
     aliases: [mt]
     permission: motopoly.use
 

@@ -1,16 +1,16 @@
 package dev.motopoly.world
 
-import dev.motopoly.terrain.FlattenPlan
+import dev.motopoly.terrain.GeneratePlan
 import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.block.data.BlockData
 import org.bukkit.plugin.Plugin
 import org.bukkit.scheduler.BukkitTask
 
-/** The material stack of a column, copied so rebuilt ground matches the local biome. */
+/** The material stack of a column, copied so new ground matches the local biome. */
 private class ColumnProfile(val top: BlockData, val filler: BlockData, val fillerDepth: Int, val deep: BlockData)
 
-object FlattenJob {
+object GenerateJob {
     private const val MAX_FILLER_DEPTH = 6
     private val AIR = Material.AIR.createBlockData()
     private val STONE = Material.STONE.createBlockData()
@@ -18,45 +18,64 @@ object FlattenJob {
     /**
      * Works out every block edit for [plan]. Reads only from the snapshots in
      * [grid], so it is safe to call off the main thread.
+     *
+     * Each column: everything above the new surface is removed, the surface
+     * gets the material stack of the nearest column outside the selection, and
+     * any air or water underneath is filled down to solid ground (at most
+     * [maxFillDepth] blocks).
      */
-    fun computeChanges(grid: SurfaceGrid, plan: FlattenPlan, clearTrees: Boolean): ChangeSet {
+    fun computeChanges(grid: SurfaceGrid, plan: GeneratePlan, maxFillDepth: Int): ChangeSet {
         val changes = ChangeSet(grid.world.uid)
         val m = grid.margin
         val w = grid.width - 2 * m
         val d = grid.depth - 2 * m
+        val floor = grid.world.minHeight
         val ceiling = grid.world.maxHeight - 1
+        val profiles = HashMap<Int, ColumnProfile>()
 
         for (iz in 0 until d) {
             for (ix in 0 until w) {
                 val x = grid.originX + m + ix
                 val z = grid.originZ + m + iz
-                val gi = grid.index(x, z)
-                val old = grid.heights[gi]
-                val new = plan.target()[iz * w + ix]
-                if (new == old && !clearTrees) continue
+                val surface = plan.target()[iz * w + ix]
 
-                val profile = profileOf(grid, x, old, z)
+                val (bx, bz) = nearestOutside(ix, iz, w, d)
+                val boundaryX = grid.originX + m + bx
+                val boundaryZ = grid.originZ + m + bz
+                val profile = profiles.getOrPut(grid.index(boundaryX, boundaryZ)) {
+                    profileOf(grid, boundaryX, grid.heights[grid.index(boundaryX, boundaryZ)], boundaryZ)
+                }
+
                 fun set(y: Int, data: BlockData) {
-                    if (y in grid.world.minHeight..ceiling) changes.add(x, y, z, grid.blockData(x, y, z), data)
+                    if (y in floor..ceiling) changes.add(x, y, z, grid.blockData(x, y, z), data)
                 }
 
-                // Everything above the new surface goes: lowered ground, trees, plants, standing water.
-                var clearTo = maxOf(old, grid.skyHeights[gi])
-                // Grass, flowers and snow layers don't show up in the heightmap.
-                while (clearTo < ceiling) {
-                    val above = grid.type(x, clearTo + 1, z)
-                    if (above.isAir || above.isSolid) break
-                    clearTo++
+                for (y in surface + 1..grid.skyHeights[grid.index(x, z)]) set(y, AIR)
+                set(surface, profile.top)
+                for (i in 1..profile.fillerDepth) set(surface - i, profile.filler)
+                var y = surface - profile.fillerDepth - 1
+                val lowest = surface - maxFillDepth
+                while (y >= floor && y >= lowest && !grid.type(x, y, z).isSolid) {
+                    set(y, profile.deep)
+                    y--
                 }
-                for (y in new + 1..clearTo) set(y, AIR)
-
-                set(new, profile.top)
-                for (i in 1..profile.fillerDepth) set(new - i, profile.filler)
-                // Raised ground: everything between the old surface and the filler band.
-                for (y in old..new - profile.fillerDepth - 1) set(y, profile.deep)
             }
         }
         return changes
+    }
+
+    /** Column just outside the selection, on the side closest to (ix, iz). Selection-local coordinates. */
+    private fun nearestOutside(ix: Int, iz: Int, w: Int, d: Int): Pair<Int, Int> {
+        val toLeft = ix
+        val toRight = w - 1 - ix
+        val toTop = iz
+        val toBottom = d - 1 - iz
+        return when (minOf(minOf(toLeft, toRight), minOf(toTop, toBottom))) {
+            toLeft -> -1 to iz
+            toRight -> w to iz
+            toTop -> ix to -1
+            else -> ix to d
+        }
     }
 
     private fun profileOf(grid: SurfaceGrid, x: Int, surface: Int, z: Int): ColumnProfile {

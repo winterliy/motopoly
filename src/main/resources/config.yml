@@ -1,21 +1,21 @@
 # 한 틱에 바꿀 최대 블록 수. 서버가 버벅이면 낮추세요.
 blocks-per-tick: 20000
-# 한 번에 평탄화할 수 있는 최대 칸(가로 x 세로) 수
+# 한 번에 생성할 수 있는 최대 칸(가로 x 세로) 수
 max-columns: 262144
 # 주변 지형 분석에 쓸 선택 영역 바깥 여백(블록)
 analysis-margin: 8
 # 플레이어마다 되돌릴 수 있는 작업 수
 undo-depth: 5
+# 새 지표면 아래 빈 공간(공기·물)을 최대 몇 블록 깊이까지 채울지
+max-fill-depth: 64
 
-# /mt flatten 기본값 (명령어에서 key=value로 덮어쓸 수 있음)
+# /mt generate 기본값 (명령어에서 key=value로 덮어쓸 수 있음)
 defaults:
   # 기복 높이(블록). auto면 주변 지형을 분석해서 정함
   rough: auto
   # 기복의 가로 크기(블록). 클수록 완만한 언덕
   scale: 48
-  # 가장자리 스무딩 폭(블록) 기본값. 플레이어별로 /mt edge <n>으로 바꿀 수 있음. 0이면 경계가 각지게 끊김
+  # 가장자리 스무딩 폭(블록) 기본값. 플레이어별로 /mt edge <n>으로 바꿀 수 있음
   feather: 10
   # 마무리 스무딩 횟수
   smooth: 2
-  # 선택 영역의 나무·풀 제거 여부 (true / false)
-  clear-trees: true

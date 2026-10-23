@@ -10,40 +10,58 @@ import java.util.Arrays;
  */
 public record TerrainStats(int min, int max, double mean, int median, double stdDev, double roughness) {
 
+    /** Statistics over a whole width*depth grid. */
     public static TerrainStats of(int[] heights, int width, int depth) {
+        return of(heights, width, depth, -1);
+    }
+
+    /**
+     * Statistics over the band of {@code margin} cells around the edge of the
+     * grid only, i.e. the terrain surrounding a selection.
+     */
+    public static TerrainStats ofBand(int[] heights, int fullW, int fullD, int margin) {
+        if (margin <= 0) throw new IllegalArgumentException("margin must be > 0");
+        return of(heights, fullW, fullD, margin);
+    }
+
+    private static TerrainStats of(int[] heights, int width, int depth, int bandMargin) {
         if (heights.length != width * depth || heights.length == 0) {
             throw new IllegalArgumentException("heights must be a non-empty width*depth grid");
         }
-        int[] sorted = heights.clone();
+        int[] values = new int[heights.length];
+        int count = 0;
+        double lapSum = 0;
+        int lapCount = 0;
+        for (int z = 0; z < depth; z++) {
+            for (int x = 0; x < width; x++) {
+                if (bandMargin > 0 && x >= bandMargin && x < width - bandMargin
+                        && z >= bandMargin && z < depth - bandMargin) {
+                    continue;
+                }
+                int i = z * width + x;
+                values[count++] = heights[i];
+                if (x > 0 && x < width - 1 && z > 0 && z < depth - 1) {
+                    int lap = heights[i - 1] + heights[i + 1] + heights[i - width] + heights[i + width] - 4 * heights[i];
+                    lapSum += Math.abs(lap);
+                    lapCount++;
+                }
+            }
+        }
+        int[] sorted = Arrays.copyOf(values, count);
         Arrays.sort(sorted);
 
         double sum = 0;
-        for (int h : heights) {
-            sum += h;
-        }
-        double mean = sum / heights.length;
+        for (int h : sorted) sum += h;
+        double mean = sum / count;
         double var = 0;
-        for (int h : heights) {
-            var += (h - mean) * (h - mean);
-        }
-
-        double lapSum = 0;
-        int lapCount = 0;
-        for (int z = 1; z < depth - 1; z++) {
-            for (int x = 1; x < width - 1; x++) {
-                int i = z * width + x;
-                int lap = heights[i - 1] + heights[i + 1] + heights[i - width] + heights[i + width] - 4 * heights[i];
-                lapSum += Math.abs(lap);
-                lapCount++;
-            }
-        }
+        for (int h : sorted) var += (h - mean) * (h - mean);
 
         return new TerrainStats(
                 sorted[0],
-                sorted[sorted.length - 1],
+                sorted[count - 1],
                 mean,
-                sorted[sorted.length / 2],
-                Math.sqrt(var / heights.length),
+                sorted[count / 2],
+                Math.sqrt(var / count),
                 lapCount == 0 ? 0 : lapSum / lapCount);
     }
 
