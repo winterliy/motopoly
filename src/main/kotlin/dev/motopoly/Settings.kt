@@ -16,6 +16,10 @@ data class Settings(
     /** Borrow topography, materials and plants from a same-seed twin world. */
     val referenceTerrain: Boolean,
     val copyPlants: Boolean,
+    /** Steepest height difference between neighbouring columns; 0 turns the slope limit off. */
+    val maxStep: Double,
+    /** How far sand reaches inland from water. */
+    val beachWidth: Int,
 ) {
     companion object {
         fun load(config: FileConfiguration) = Settings(
@@ -29,6 +33,8 @@ data class Settings(
             scale = config.getDouble("scale", 48.0).coerceAtLeast(1.0),
             referenceTerrain = config.getBoolean("reference-terrain", true),
             copyPlants = config.getBoolean("copy-plants", true),
+            maxStep = config.getDouble("max-step", 1.0).coerceIn(0.0, 16.0),
+            beachWidth = config.getInt("beach-width", 5).coerceIn(0, 32),
         )
 
         /** "auto" → NaN, a non-negative number → itself, anything else → null. */

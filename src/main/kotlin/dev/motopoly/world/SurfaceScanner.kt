@@ -53,14 +53,16 @@ object SurfaceScanner {
         Material.BEE_NEST, Material.MANGROVE_ROOTS, Material.MUDDY_MANGROVE_ROOTS,
         Material.POINTED_DRIPSTONE, Material.CHORUS_PLANT, Material.CHORUS_FLOWER,
     )
+    // Frozen water counts as water: it's a lid on a lake, not ground to copy.
     private val LIQUID = setOf(
         Material.WATER, Material.LAVA, Material.BUBBLE_COLUMN,
         Material.KELP, Material.KELP_PLANT, Material.SEAGRASS, Material.TALL_SEAGRASS,
+        Material.ICE, Material.FROSTED_ICE,
     )
 
     /** Ground the generator should treat as the land surface. */
     fun isTerrain(type: Material) =
-        type.isSolid && type !in NON_TERRAIN && !Tag.LOGS.isTagged(type) && !Tag.LEAVES.isTagged(type)
+        type.isSolid && type !in NON_TERRAIN && type !in LIQUID && !Tag.LOGS.isTagged(type) && !Tag.LEAVES.isTagged(type)
 
     fun isLiquid(type: Material) = type in LIQUID
 
@@ -113,7 +115,12 @@ object SurfaceScanner {
                 while (y > floor) {
                     val type = snap.getBlockType(lx, y, lz)
                     if (isTerrain(type)) break
-                    if (water == Int.MIN_VALUE && isLiquid(type)) water = y
+                    if (isLiquid(type)) {
+                        if (water == Int.MIN_VALUE) water = y
+                    } else if (water != Int.MIN_VALUE) {
+                        // Out through the bottom of the water into a cave or ravine: the water's floor is the ground here.
+                        break
+                    }
                     y--
                 }
                 val i = (z - minZ) * width + (x - minX)

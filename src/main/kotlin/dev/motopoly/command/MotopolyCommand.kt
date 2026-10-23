@@ -13,6 +13,7 @@ import dev.motopoly.world.GenerateJob
 import dev.motopoly.world.ReferenceWorlds
 import dev.motopoly.world.SurfaceGrid
 import dev.motopoly.world.SurfaceScanner
+import dev.motopoly.world.Generation
 import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
 import org.bukkit.command.Command
@@ -161,7 +162,10 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             return
         }
         val region = region(player) ?: return
-        val params = GenerateParams(y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, world.seed, minY, maxY)
+        val params = GenerateParams(
+            y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, plugin.settings.maxStep,
+            world.seed, minY, maxY,
+        )
         generate(player, region, params)
     }
 
@@ -211,11 +215,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             ?.let { SurfaceScanner.scan(region.copy(world = it), margin, plugin.async).thenApply<SurfaceGrid?> { g -> g } }
             ?: CompletableFuture.completedFuture(null)
         main.thenCombineAsync(ref, { grid, refGrid ->
-            // Water around the selection counts at its surface, so new land meets it like a shore.
-            val plan = TerrainGenerator.plan(
-                grid.surface, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, refGrid?.heights
-            )
-            plan to GenerateJob.computeChanges(grid, plan, settings.maxFillDepth, refGrid, settings.copyPlants)
+            Generation.design(grid, refGrid, params, settings.maxFillDepth, settings.copyPlants, settings.beachWidth)
         }, plugin.async).whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
                 if (error != null) {
@@ -224,11 +224,13 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     plugin.slF4JLogger.warn("generate failed", error)
                     return@Runnable
                 }
-                val (plan, changes) = result
+                val (plan, changes, used, water) = result
                 val target = plan.target()
+                val smoothNote = if (used.edge() != params.edge()) "${used.edge()}(섬이라 자동 확장)" else "${used.edge()}"
                 player.msg(
-                    "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
-                        "smooth <aqua>${params.edge()}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
+                    (if (water.island) "<aqua>섬 모드</aqua> <gray>(수면 Y ${water.level})</gray> " else "") +
+                        "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
+                        "smooth <aqua>$smoothNote</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
                         (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ") +
                         "<gray>(블록 변경 ${changes.size}개)"
                 )
@@ -281,3 +283,4 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         return suggestions.filter { it.startsWith(last) }
     }
 }
+

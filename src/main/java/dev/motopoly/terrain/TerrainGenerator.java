@@ -19,8 +19,9 @@ package dev.motopoly.terrain;
  *       Without a reference, a stand-in: vanilla plains are the high-erosion
  *       case of the density function, i.e. low-amplitude octave noise, so
  *       that noise is used, modulated by a slower "erosion" noise. Either way
- *       the detail fades in over the edge band so the edge still lines up.</li>
- *   <li>A light blur, then rounding to whole blocks.</li>
+ *       the detail is pasted with Poisson seamless cloning, so it reaches the
+ *       edge and still lines up with the surroundings.</li>
+ *   <li>A light blur, thermal erosion to cap slopes, then rounding to whole blocks.</li>
  * </ol>
  *
  * <p>Input is the selection plus a margin on every side. The margin is never
@@ -35,6 +36,8 @@ public final class TerrainGenerator {
     // Vanilla relief keeps its natural size under rough=auto, within these bounds.
     private static final double AUTO_RELIEF_MIN = 0.4;
     private static final double AUTO_RELIEF_MAX = 2.5;
+    // 5x5 median: removes holes and spikes up to two blocks wide, keeps real slopes.
+    private static final int DESPIKE_RADIUS = 2;
 
     private TerrainGenerator() {
     }
@@ -69,11 +72,13 @@ public final class TerrainGenerator {
         if (margin < 1 || w <= 0 || d <= 0) {
             throw new IllegalArgumentException("need margin >= 1 and a selection of at least 1x1");
         }
+        // A ravine or cave mouth just outside would otherwise drag the new ground down into it.
+        heights = despikeMargin(heights, fullW, fullD, margin, DESPIKE_RADIUS);
 
         TerrainStats around = TerrainStats.ofBand(heights, fullW, fullD, margin);
 
-        // Unit-scale detail per selection cell, roughly in [-1, 1], times its amplitude.
-        double[] detail = new double[w * d];
+        // Natural detail over the whole expanded grid (the ring is needed for the seam fix below).
+        double[] detail = new double[fullW * fullD];
         double roughness;
         boolean vanilla = false;
         double[] relief = reference == null ? null : relief(reference, fullW, fullD, reliefRadius(params.scale()));
@@ -82,42 +87,56 @@ public final class TerrainGenerator {
             vanilla = true;
             roughness = Double.isNaN(params.roughness())
                     ? clamp(reliefSize, AUTO_RELIEF_MIN, AUTO_RELIEF_MAX) : params.roughness();
-            for (int z = 0; z < d; z++) {
-                for (int x = 0; x < w; x++) {
-                    double r = relief[(z + margin) * fullW + (x + margin)] / reliefSize;
-                    detail[z * w + x] = roughness * clamp(r, -1.5, 1.5);
-                }
+            for (int i = 0; i < detail.length; i++) {
+                detail[i] = roughness * clamp(relief[i] / reliefSize, -1.5, 1.5);
             }
         } else {
             roughness = Double.isNaN(params.roughness()) ? autoRoughness(around) : params.roughness();
             OctaveNoise noise = new OctaveNoise(params.seed(), 4);
             OctaveNoise erosion = new OctaveNoise(params.seed() ^ EROSION_SALT, 2);
-            for (int z = 0; z < d; z++) {
-                for (int x = 0; x < w; x++) {
-                    int wx = originX + margin + x;
-                    int wz = originZ + margin + z;
+            for (int z = 0; z < fullD; z++) {
+                for (int x = 0; x < fullW; x++) {
+                    int wx = originX + x;
+                    int wz = originZ + z;
                     double n = clamp(noise.sample(wx / params.scale(), wz / params.scale()) * NOISE_GAIN, -1, 1);
                     double e = erosion.sample(wx / (params.scale() * 4), wz / (params.scale() * 4));
-                    detail[z * w + x] = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5)) * n;
+                    detail[z * fullW + x] = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5)) * n;
                 }
             }
         }
 
-        double[] field = membrane(heights, fullW, fullD, margin, w, d);
+        double[] boundary = new double[fullW * fullD];
+        for (int i = 0; i < boundary.length; i++) boundary[i] = heights[i];
+        double[] field = membrane(boundary, fullW, fullD, margin, w, d);
         for (int z = 0; z < d; z++) {
             for (int x = 0; x < w; x++) {
                 int fi = (z + margin) * fullW + (x + margin);
-                double t = edgeWeight(x, z, w, d, params.edge());
-                double h = field[fi];
                 if (params.baseY() != null) {
-                    h += (params.baseY() - h) * t;
+                    double t = edgeWeight(x, z, w, d, params.edge());
+                    field[fi] += (params.baseY() - field[fi]) * t;
                 }
-                field[fi] = h + detail[z * w + x] * t;
+            }
+        }
+
+        // Poisson seamless cloning (Pérez et al. 2003): paste the detail at full
+        // strength right up to the edge, then add the harmonic correction that
+        // cancels it on the boundary ring. The seam vanishes while the texture
+        // keeps its gradients, instead of fading out across the edge band.
+        double[] seam = new double[fullW * fullD];
+        for (int i = 0; i < seam.length; i++) seam[i] = -detail[i];
+        double[] correction = membrane(seam, fullW, fullD, margin, w, d);
+        for (int z = margin; z < margin + d; z++) {
+            for (int x = margin; x < margin + w; x++) {
+                int fi = z * fullW + x;
+                field[fi] += detail[fi] + correction[fi];
             }
         }
 
         for (int pass = 0; pass < params.smoothPasses(); pass++) {
             field = blur(field, fullW, fullD, margin);
+        }
+        if (params.maxStep() > 0) {
+            thermalErosion(field, fullW, fullD, margin, params.maxStep());
         }
 
         int[] target = new int[w * d];
@@ -128,6 +147,39 @@ public final class TerrainGenerator {
             }
         }
         return new GeneratePlan(target, roughness, around, vanilla);
+    }
+
+    /**
+     * Median filter over the margin only (the selection's own cells are
+     * neither changed nor read): narrow ravines, cave mouths, single pillars
+     * and the like stop counting as the surroundings' ground level.
+     */
+    static int[] despikeMargin(int[] heights, int fullW, int fullD, int margin, int radius) {
+        int[] out = heights.clone();
+        int[] window = new int[(2 * radius + 1) * (2 * radius + 1)];
+        for (int z = 0; z < fullD; z++) {
+            for (int x = 0; x < fullW; x++) {
+                if (isInner(x, z, fullW, fullD, margin)) continue;
+                int n = 0;
+                for (int dz = -radius; dz <= radius; dz++) {
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        int xx = x + dx;
+                        int zz = z + dz;
+                        if (xx < 0 || zz < 0 || xx >= fullW || zz >= fullD || isInner(xx, zz, fullW, fullD, margin)) {
+                            continue;
+                        }
+                        window[n++] = heights[zz * fullW + xx];
+                    }
+                }
+                java.util.Arrays.sort(window, 0, n);
+                out[z * fullW + x] = window[n / 2];
+            }
+        }
+        return out;
+    }
+
+    private static boolean isInner(int x, int z, int fullW, int fullD, int margin) {
+        return x >= margin && x < fullW - margin && z >= margin && z < fullD - margin;
     }
 
     /** Features wider than about this many blocks count as hills, not bumps. */
@@ -196,11 +248,8 @@ public final class TerrainGenerator {
      * boundary. Starts from a transfinite blend of the four edges, which is
      * already close, then relaxes with successive over-relaxation.
      */
-    static double[] membrane(int[] heights, int fullW, int fullD, int margin, int w, int d) {
-        double[] u = new double[fullW * fullD];
-        for (int i = 0; i < u.length; i++) {
-            u[i] = heights[i];
-        }
+    static double[] membrane(double[] heights, int fullW, int fullD, int margin, int w, int d) {
+        double[] u = heights.clone();
         int left = margin - 1;
         int right = margin + w;
         int top = margin - 1;
@@ -238,6 +287,101 @@ public final class TerrainGenerator {
             if (maxDelta < CONVERGED) break;
         }
         return u;
+    }
+
+    /**
+     * The end state of thermal erosion, solved directly instead of simulated:
+     * no two neighbouring columns may differ by more than the talus step.
+     * <ol>
+     *   <li>The fixed ring bounds every cell to {@code ring ± talus·distance}
+     *       (cones grown inward from the boundary), so pits next to high
+     *       ground and plateaus above low ground both get a ramp.</li>
+     *   <li>Remaining cliffs inside are cut down to the largest slope-limited
+     *       surface below them (a min-plus distance transform).</li>
+     * </ol>
+     * Each step is two raster sweeps (exact for 4-neighbour distance). A little
+     * slack keeps rounded heights within one block of each other.
+     */
+    static void thermalErosion(double[] h, int fullW, int fullD, int margin, double maxStep) {
+        double talus = Math.max(0.05, maxStep - 0.05);
+        int w = fullW - 2 * margin;
+        int d = fullD - 2 * margin;
+        double[] upper = new double[h.length];
+        double[] lower = new double[h.length];
+        for (int z = margin - 1; z <= margin + d; z++) {
+            for (int x = margin - 1; x <= margin + w; x++) {
+                int i = z * fullW + x;
+                boolean inner = x >= margin && x < margin + w && z >= margin && z < margin + d;
+                upper[i] = inner ? Double.POSITIVE_INFINITY : h[i];
+                lower[i] = inner ? Double.NEGATIVE_INFINITY : h[i];
+            }
+        }
+        sweep(upper, fullW, margin, w, d, talus, true);
+        sweep(lower, fullW, margin, w, d, -talus, false);
+
+        for (int round = 0; round < 3; round++) {
+            for (int z = margin; z < margin + d; z++) {
+                for (int x = margin; x < margin + w; x++) {
+                    int i = z * fullW + x;
+                    double lo = lower[i];
+                    double hi = upper[i];
+                    // A boundary steeper than the talus leaves no valid range: split the difference.
+                    h[i] = lo > hi ? (lo + hi) / 2 : clamp(h[i], lo, hi);
+                }
+            }
+            sweep(h, fullW, margin, w, d, talus, true);
+        }
+    }
+
+    /**
+     * Raster passes over the selection, reading the ring as fixed:
+     * {@code v = min(v, neighbour + step)} when {@code takeMin}, else
+     * {@code v = max(v, neighbour + step)}. Two passes are exact for a plain
+     * distance transform, but the ring doesn't relay values along itself, so
+     * a path like "in from the right, then down" needs another round; repeat
+     * forward/backward pairs until nothing changes.
+     */
+    static void sweep(double[] v, int fullW, int margin, int w, int d, double step, boolean takeMin) {
+        for (int round = 0; round < w + d; round++) {
+            boolean changed = false;
+            for (int z = margin; z < margin + d; z++) {
+                for (int x = margin; x < margin + w; x++) {
+                    int i = z * fullW + x;
+                    double next = pick(v[i], v[i - 1] + step, v[i - fullW] + step, takeMin);
+                    if (next != v[i]) {
+                        v[i] = next;
+                        changed = true;
+                    }
+                }
+            }
+            for (int z = margin + d - 1; z >= margin; z--) {
+                for (int x = margin + w - 1; x >= margin; x--) {
+                    int i = z * fullW + x;
+                    double next = pick(v[i], v[i + 1] + step, v[i + fullW] + step, takeMin);
+                    if (next != v[i]) {
+                        v[i] = next;
+                        changed = true;
+                    }
+                }
+            }
+            if (!changed) return;
+        }
+    }
+
+    private static double pick(double a, double b, double c, boolean takeMin) {
+        return takeMin ? Math.min(a, Math.min(b, c)) : Math.max(a, Math.max(b, c));
+    }
+
+    /**
+     * Edge band wide enough to climb from {@code level} (e.g. the sea floor
+     * around an island) to {@code baseY} without exceeding {@code maxStep}:
+     * a smoothstep ramp is 1.5x steeper than linear at its middle. Never
+     * narrower than {@code edge}, never wider than half the selection.
+     */
+    public static int islandEdge(int baseY, double level, int edge, int w, int d, double maxStep) {
+        double slope = maxStep > 0 ? maxStep : 1.0;
+        int needed = (int) Math.ceil(1.5 * Math.abs(baseY - level) / slope);
+        return Math.min(Math.max(edge, needed), Math.max(1, Math.min(w, d) / 2));
     }
 
     /** Flat land stays nearly flat; rugged surroundings leave gentle bumps. */
