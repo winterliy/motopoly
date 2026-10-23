@@ -26,12 +26,14 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
 private const val MAX_SMOOTH = 64
+private const val MAX_STEP = 16
 private const val BLUR_PASSES = 2
 
 class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: WandListener) : CommandExecutor, TabCompleter {
     private val busy = HashSet<UUID>()
     private val smoothKey = NamespacedKey(plugin, "smooth")
     private val roughKey = NamespacedKey(plugin, "rough")
+    private val stepKey = NamespacedKey(plugin, "step")
 
     private val subcommands = listOf("help", "wand", "pos1", "pos2", "info", "gen", "config", "undo", "reload")
 
@@ -71,7 +73,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             <gold>사용 순서</gold>
             <yellow>1.</yellow> <yellow>/$label pos1</yellow>, <yellow>/$label pos2</yellow> <gray>구역 지정 (또는 /$label wand 로 클릭)
             <yellow>2.</yellow> <yellow>/$label gen <y></yellow> <gray>구역 땅을 Y 높이로 올리거나 내리고, 주변과 자연스럽게 이어요
-            <yellow>3.</yellow> <yellow>/$label config <smooth|rough> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
+            <yellow>3.</yellow> <yellow>/$label config <smooth|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
             <yellow>4.</yellow> <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
             <gray>기타: /$label info (지형 분석), /$label config (현재 설정 보기), /$label reload
             """.trimIndent()
@@ -84,16 +86,40 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private fun roughOf(player: Player): Double =
         player.persistentDataContainer.get(roughKey, PersistentDataType.DOUBLE) ?: plugin.settings.defaultRough
 
+    private fun stepOf(player: Player): Int =
+        player.persistentDataContainer.get(stepKey, PersistentDataType.INTEGER) ?: plugin.settings.maxStep.toInt()
+
     private fun roughText(rough: Double) = if (rough.isNaN()) "auto" else "%.1f".format(rough)
+
+    private fun stepText(step: Int) = if (step == 0) "끔" else "${step}블록"
 
     private fun config(player: Player, label: String, key: String?, value: String?) {
         val pdc = player.persistentDataContainer
         val s = plugin.settings
         when (key?.lowercase()) {
             null -> player.msg(
-                "<white>현재 설정: smooth <aqua>${smoothOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua> " +
-                    "<gray>(/$label config <smooth|rough> [값])"
+                "<white>현재 설정: smooth <aqua>${smoothOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua>, " +
+                    "step <aqua>${stepText(stepOf(player))}</aqua> <gray>(/$label config <smooth|rough|step> [값])"
             )
+            "step" -> when {
+                value == null -> {
+                    pdc.remove(stepKey)
+                    player.msg("<green>step을 기본값 <aqua>${stepText(s.maxStep.toInt())}</aqua>(으)로 되돌렸어요.")
+                }
+                else -> {
+                    val n = value.toIntOrNull()?.takeIf { it in 0..MAX_STEP } ?: run {
+                        player.msg("<red>step은 0~$MAX_STEP 사이 정수예요. (0이면 경사 제한을 꺼요)")
+                        return
+                    }
+                    pdc.set(stepKey, PersistentDataType.INTEGER, n)
+                    val note = when (n) {
+                        0 -> "경사 제한 없음, 절벽이 생길 수 있어요"
+                        1 -> "한 칸씩 걸어 올라갈 수 있는 가장 완만한 경사예요"
+                        else -> "옆 칸과 최대 ${n}블록까지 차이 나요, 경사가 짧고 가팔라져요"
+                    }
+                    player.msg("<green>step: <aqua>${stepText(n)}</aqua> <gray>($note)")
+                }
+            }
             "smooth" -> when {
                 value == null -> {
                     pdc.remove(smoothKey)
@@ -128,7 +154,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     player.msg("<green>rough: <aqua>${roughText(r)}</aqua> <gray>($note)")
                 }
             }
-            else -> player.msg("<red>설정 항목은 smooth, rough 중 하나예요.")
+            else -> player.msg("<red>설정 항목은 smooth, rough, step 중 하나예요.")
         }
     }
 
@@ -163,7 +189,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         }
         val region = region(player) ?: return
         val params = GenerateParams(
-            y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, plugin.settings.maxStep,
+            y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, stepOf(player).toDouble(),
             world.seed, minY, maxY,
         )
         generate(player, region, params)
@@ -232,7 +258,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 player.msg(
                     (if (water.island) "<aqua>섬 모드</aqua> <gray>(수면 Y ${water.level})</gray> " else "") +
                         "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
-                        "smooth <aqua>$smoothNote</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
+                        "smooth <aqua>$smoothNote</aqua>, step <aqua>${stepText(used.maxStep().toInt())}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
                         (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ") +
                         "<gray>(블록 변경 ${changes.size}개)"
                 )
@@ -275,7 +301,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val sub = args[0].lowercase()
         val suggestions = when {
             args.size == 1 -> subcommands
-            sub == "config" && args.size == 2 -> listOf("smooth", "rough")
+            sub == "config" && args.size == 2 -> listOf("smooth", "rough", "step")
+            sub == "config" && args.size == 3 && args[1].equals("step", true) -> listOf("0", "1", "2", "3")
             sub == "config" && args.size == 3 && args[1].equals("smooth", true) -> listOf("0", "5", "10", "16")
             sub == "config" && args.size == 3 && args[1].equals("rough", true) -> listOf("auto", "0", "1", "2")
             (sub == "gen" || sub == "generate") && args.size == 2 && sender is Player ->

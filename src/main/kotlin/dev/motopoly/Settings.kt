@@ -16,7 +16,7 @@ data class Settings(
     /** Borrow topography, materials and plants from a same-seed twin world. */
     val referenceTerrain: Boolean,
     val copyPlants: Boolean,
-    /** Steepest height difference between neighbouring columns; 0 turns the slope limit off. */
+    /** Default steepest height difference between neighbouring columns (0 = off); players override it with /mt config step. */
     val maxStep: Double,
     /** How far sand reaches inland from water. */
     val beachWidth: Int,
@@ -35,7 +35,7 @@ data class Settings(
             scale = config.getDouble("scale", 48.0).coerceAtLeast(1.0),
             referenceTerrain = config.getBoolean("reference-terrain", true),
             copyPlants = config.getBoolean("copy-plants", true),
-            maxStep = config.getDouble("max-step", 1.0).coerceIn(0.0, 16.0),
+            maxStep = config.getInt("max-step", 1).coerceIn(0, 16).toDouble(),
             beachWidth = config.getInt("beach-width", 5).coerceIn(0, 32),
             fillOres = config.getBoolean("fill-ores", true),
         )
