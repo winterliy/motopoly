@@ -7,7 +7,8 @@ import java.util.function.IntBinaryOperator;
 import static org.junit.jupiter.api.Assertions.*;
 
 class TerrainGeneratorTest {
-    private static final int MARGIN = 8;
+    // Fixed columns beyond the band.
+    private static final int RING = 8;
 
     private static int[] grid(int fullW, int fullD, IntBinaryOperator height) {
         int[] h = new int[fullW * fullD];
@@ -19,93 +20,226 @@ class TerrainGeneratorTest {
         return h;
     }
 
-    private static GenerateParams params(Integer base, double rough, int edge, int smooth) {
-        return new GenerateParams(base, rough, 48, edge, smooth, 0, 1234L, -64, 319);
+    private static GenerateParams flat(int y, int band, double step) {
+        return new GenerateParams(y, y, 0, 48, band, 2, step, 1234L, -64, 319);
     }
 
-    private static GeneratePlan plan(int[] h, int w, int d, GenerateParams p) {
-        return TerrainGenerator.plan(h, w + 2 * MARGIN, d + 2 * MARGIN, MARGIN, 0, 0, p);
+    private static GenerateParams range(int lo, int hi, double rough, int band) {
+        return new GenerateParams(lo, hi, rough, 48, band, 2, 1.0, 1234L, -64, 319);
+    }
+
+    /** A selection of w x d with its band and fixed ring, ready to plan. */
+    private record Site(int w, int d, int band, int margin, int fullW, int fullD) {
+        Site(int w, int d, int band) {
+            this(w, d, band, band + RING, w + 2 * (band + RING), d + 2 * (band + RING));
+        }
+
+        int[] heights(IntBinaryOperator height) {
+            return grid(fullW, fullD, height);
+        }
+
+        GeneratePlan plan(int[] h, GenerateParams p, int[] reference) {
+            return TerrainGenerator.plan(h, fullW, fullD, margin, 0, 0, p, reference);
+        }
+
+        boolean inZone(int fx, int fz) {
+            return fx >= margin && fx < margin + w && fz >= margin && fz < margin + d;
+        }
+
+        /** Target at expanded-grid coordinates (inside the selection or its band). */
+        int at(int[] target, int fx, int fz) {
+            int o = margin - band;
+            return target[(fz - o) * (w + 2 * band) + (fx - o)];
+        }
+
+        int bandW() {
+            return w + 2 * band;
+        }
+
+        int bandD() {
+            return d + 2 * band;
+        }
+    }
+
+    private static void assertSteps(int[] t, int bw, int bd, int max, String what) {
+        for (int z = 0; z < bd; z++) {
+            for (int x = 0; x < bw; x++) {
+                if (x > 0) assertTrue(Math.abs(t[z * bw + x] - t[z * bw + x - 1]) <= max, what + " x step at (" + x + "," + z + ")");
+                if (z > 0) assertTrue(Math.abs(t[z * bw + x] - t[(z - 1) * bw + x]) <= max, what + " z step at (" + x + "," + z + ")");
+            }
+        }
     }
 
     @Test
-    void flatSurroundingsGiveFlatGround() {
-        int w = 40, d = 30;
-        int[] h = grid(w + 2 * MARGIN, d + 2 * MARGIN, (x, z) -> 70);
-        for (int y : plan(h, w, d, params(null, 0, 10, 2)).target()) {
-            assertEquals(70, y);
+    void singleLevelFillsTheWholeSelectionFlat() {
+        Site s = new Site(40, 30, 10);
+        int[] h = s.heights((x, z) -> 64 + (int) (5 * Math.sin(x / 6.0) + 4 * Math.cos(z / 5.0)));
+        int[] t = s.plan(h, flat(70, 10, 1.0), h).target();
+        for (int fz = s.margin; fz < s.margin + s.d; fz++) {
+            for (int fx = s.margin; fx < s.margin + s.w; fx++) assertEquals(70, s.at(t, fx, fz), "(" + fx + "," + fz + ")");
         }
     }
 
     @Test
     void insideOfSelectionIsIgnored() {
-        int w = 32, d = 32, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] plain = grid(fullW, fullD, (x, z) -> 64 + x / 8);
+        Site s = new Site(32, 32, 10);
+        int[] plain = s.heights((x, z) -> 64 + x / 8);
         // Same surroundings, but a tower and a pit inside the selection.
-        int[] built = grid(fullW, fullD, (x, z) -> {
-            boolean inside = x >= MARGIN && x < MARGIN + w && z >= MARGIN && z < MARGIN + d;
-            if (!inside) return 64 + x / 8;
-            return (x + z) % 2 == 0 ? 200 : 10;
-        });
-        GenerateParams p = params(null, 1.5, 10, 2);
-        assertArrayEquals(plan(plain, w, d, p).target(), plan(built, w, d, p).target());
+        int[] built = s.heights((x, z) -> s.inZone(x, z) ? ((x + z) % 2 == 0 ? 200 : 10) : 64 + x / 8);
+        GenerateParams p = range(62, 66, 1.5, 10);
+        assertArrayEquals(s.plan(plain, p, null).target(), s.plan(built, p, null).target());
     }
 
     @Test
-    void slopeAcrossSelectionIsBridgedSmoothly() {
-        // Ground rises 1 block every 2 blocks west to east; the inside must follow it.
-        int w = 60, d = 40, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) -> 60 + x / 2);
-        int[] target = plan(h, w, d, params(null, 0, 10, 0)).target();
-        for (int z = 0; z < d; z++) {
-            for (int x = 0; x < w; x++) {
-                int expected = 60 + (x + MARGIN) / 2;
-                assertTrue(Math.abs(target[z * w + x] - expected) <= 1,
-                        "(" + x + "," + z + ") " + target[z * w + x] + " vs " + expected);
+    void matchingSurroundingsAreLeftAsTheyAre() {
+        Site s = new Site(20, 20, 10);
+        int[] h = s.heights((x, z) -> 70);
+        for (int y : s.plan(h, flat(70, 10, 1.0), null).target()) assertEquals(70, y);
+    }
+
+    @Test
+    void bandEasesIntoTheSurroundingsOutsideTheSelection() {
+        // 8 blocks up from 62 to 70 over a 16-wide band.
+        Site s = new Site(30, 30, 16);
+        int[] h = s.heights((x, z) -> 62);
+        int[] t = s.plan(h, flat(70, 16, 1.0), null).target();
+        assertSteps(t, s.bandW(), s.bandD(), 1, "flat");
+        int row = s.margin + s.d / 2;
+        // Outermost band column meets the untouched ground, the climb happens outside the selection.
+        assertTrue(Math.abs(s.at(t, s.margin - s.band, row) - 62) <= 1, "outer end " + s.at(t, s.margin - s.band, row));
+        assertEquals(70, s.at(t, s.margin, row));
+        for (int fx = s.margin - s.band + 1; fx <= s.margin; fx++) {
+            assertTrue(s.at(t, fx, row) >= s.at(t, fx - 1, row), "ramp climbs at " + fx);
+        }
+        // Smoothstep: no crease, so the ramp is flatter at both ends than in the middle.
+        int ends = (s.at(t, s.margin - s.band + 3, row) - s.at(t, s.margin - s.band, row))
+                + (s.at(t, s.margin, row) - s.at(t, s.margin - 3, row));
+        int middle = s.at(t, s.margin - s.band / 2 + 3, row) - s.at(t, s.margin - s.band / 2 - 3, row);
+        assertTrue(ends <= middle, "ends " + ends + " vs middle " + middle);
+    }
+
+    @Test
+    void zoneStaysPinnedWhenBandIsShort() {
+        // 25 blocks up with only a 6-block band: the ramp gets steeper, the zone never sinks.
+        Site s = new Site(20, 20, 6);
+        int[] h = s.heights((x, z) -> 64);
+        int[] t = s.plan(h, flat(89, 6, 1.0), null).target();
+        for (int fz = s.margin; fz < s.margin + s.d; fz++) {
+            for (int fx = s.margin; fx < s.margin + s.w; fx++) assertEquals(89, s.at(t, fx, fz));
+        }
+        int row = s.margin + s.d / 2;
+        assertTrue(s.at(t, s.margin - s.band, row) < 89 - 10, "outer column must stay near the surroundings");
+    }
+
+    @Test
+    void shortBandMayDropSeveralBlocksPerColumn() {
+        // 30 blocks down over a 5-block band: steep steps are fine, but the band still connects both sides.
+        Site s = new Site(20, 20, 5);
+        int[] h = s.heights((x, z) -> 90);
+        int[] t = s.plan(h, flat(60, 5, 1.0), null).target();
+        int row = s.margin + s.d / 2;
+        assertEquals(60, s.at(t, s.margin, row));
+        assertTrue(s.at(t, s.margin - s.band, row) > 80, "outer end " + s.at(t, s.margin - s.band, row));
+        for (int fx = s.margin - s.band + 1; fx <= s.margin; fx++) {
+            assertTrue(s.at(t, fx, row) <= s.at(t, fx - 1, row), "ramp descends at " + fx);
+        }
+    }
+
+    @Test
+    void noBandMeansNothingOutsideChanges() {
+        Site s = new Site(12, 12, 0);
+        int[] h = s.heights((x, z) -> 60);
+        GeneratePlan plan = s.plan(h, flat(66, 0, 1.0), null);
+        assertEquals(0, plan.band());
+        assertEquals(12 * 12, plan.target().length);
+        for (int y : plan.target()) assertEquals(66, y);
+    }
+
+    @Test
+    void rangeKeepsGroundBetweenItsEnds() {
+        Site s = new Site(60, 50, 10);
+        int[] flat = s.heights((x, z) -> 62);
+        int[] hills = s.heights((x, z) -> 60 + x / 3 + (int) (2 * Math.sin(z / 4.0)));
+        for (int[] reference : new int[][] {null, flat, hills}) {
+            int[] t = s.plan(flat, range(61, 64, 1.5, 10), reference).target();
+            java.util.Set<Integer> seen = new java.util.HashSet<>();
+            for (int fz = s.margin; fz < s.margin + s.d; fz++) {
+                for (int fx = s.margin; fx < s.margin + s.w; fx++) {
+                    int y = s.at(t, fx, fz);
+                    assertTrue(y >= 61 && y <= 64, "y " + y + " at (" + fx + "," + fz + ")");
+                    seen.add(y);
+                }
             }
-        }
-    }
-
-    @Test
-    void baseLevelReachedInsideAndEdgesMeetSurroundings() {
-        int w = 60, d = 60, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) -> 80 + (int) (6 * Math.sin(x / 7.0)));
-        int[] target = plan(h, w, d, params(70, 0, 10, 2)).target();
-        assertEquals(70, target[(d / 2) * w + w / 2]);
-        for (int z = 0; z < d; z++) {
-            int outside = h[(z + MARGIN) * fullW + MARGIN - 1];
-            assertTrue(Math.abs(target[z * w] - outside) <= 2, "edge gap at z=" + z);
-        }
-        // No cliffs: the 10-block band spreads a ~10 block drop.
-        for (int z = 0; z < d; z++) {
-            for (int x = 1; x < w; x++) {
-                assertTrue(Math.abs(target[z * w + x] - target[z * w + x - 1]) <= 3);
-            }
-        }
-    }
-
-    @Test
-    void undulationStaysWithinRoughness() {
-        int w = 64, d = 64;
-        int[] h = grid(w + 2 * MARGIN, d + 2 * MARGIN, (x, z) -> 75);
-        for (int y : plan(h, w, d, params(null, 2, 0, 0)).target()) {
-            assertTrue(Math.abs(y - 75) <= 2, "y=" + y);
+            assertTrue(seen.size() >= 3, "range barely used: " + seen);
+            assertSteps(t, s.bandW(), s.bandD(), 1, "range");
         }
     }
 
     @Test
     void sameSeedGivesSameTerrain() {
-        int w = 20, d = 20;
-        int[] h = grid(w + 2 * MARGIN, d + 2 * MARGIN, (x, z) -> 64 + (x * z) % 5);
-        GenerateParams p = params(null, 1.5, 4, 2);
-        assertArrayEquals(plan(h, w, d, p).target(), plan(h, w, d, p).target());
+        Site s = new Site(20, 20, 6);
+        int[] h = s.heights((x, z) -> 64 + (x * z) % 5);
+        GenerateParams p = range(62, 67, 1.5, 6);
+        assertArrayEquals(s.plan(h, p, null).target(), s.plan(h, p, null).target());
+    }
+
+    @Test
+    void vanillaReferenceDrivesDetail() {
+        Site s = new Site(48, 48, 6);
+        int[] around = s.heights((x, z) -> 70);
+        // Reference terrain: a mountain slope with small bumps on it.
+        int[] reference = s.heights((x, z) -> 90 + x / 2 + ((x * 7 + z * 13) % 5 == 0 ? 2 : 0));
+        GeneratePlan plan = s.plan(around, range(68, 72, Double.NaN, 6), reference);
+        assertTrue(plan.vanillaRelief());
+        assertTrue(java.util.Arrays.stream(plan.target()).distinct().count() > 1, "no detail at all");
+    }
+
+    @Test
+    void flatReferenceFallsBackToNoise() {
+        Site s = new Site(30, 30, 4);
+        int[] flat = s.heights((x, z) -> 64);
+        assertFalse(s.plan(flat, range(62, 66, 1, 4), flat).vanillaRelief());
+    }
+
+    @Test
+    void ravineOutsideDoesNotDragGroundDown() {
+        Site s = new Site(40, 40, 6);
+        // Flat sea floor at 50 with a 2-wide ravine down to 14 running into the west edge.
+        int[] h = s.heights((x, z) -> x < s.margin && (z == 30 || z == 31) ? 14 : 50);
+        for (int y : s.plan(h, flat(50, 6, 1.0), null).target()) assertEquals(50, y);
+    }
+
+    @Test
+    void randomTerrainNeverStepsMoreThanOne() {
+        java.util.Random r = new java.util.Random(5);
+        for (int trial = 0; trial < 60; trial++) {
+            int lo = 60 + r.nextInt(20);
+            int hi = lo + (r.nextBoolean() ? 0 : r.nextInt(6));
+            int w = 30 + r.nextInt(60), d = 30 + r.nextInt(60);
+            double a = r.nextDouble() * 12;
+            int phase = trial;
+            IntBinaryOperator terrain = (x, z) -> 64 + (int) (a * Math.sin(x / 5.0 + phase) + a * Math.cos(z / 7.0));
+            // Band wide enough for the climb, so the slope limit can always hold.
+            Site s = new Site(w, d, 48);
+            GenerateParams p = new GenerateParams(lo, hi, Double.NaN, 48, 48, 2, 1.0, trial, -64, 319);
+            int[] h = s.heights(terrain);
+            int[] reference = s.heights((x, z) -> 64 + r.nextInt(3));
+            int[] t = s.plan(h, p, r.nextBoolean() ? reference : null).target();
+            assertSteps(t, s.bandW(), s.bandD(), 1, "trial " + trial);
+            for (int fz = s.margin; fz < s.margin + s.d; fz++) {
+                for (int fx = s.margin; fx < s.margin + s.w; fx++) {
+                    int y = s.at(t, fx, fz);
+                    assertTrue(y >= lo && y <= hi, "trial " + trial + ": " + y + " outside " + lo + "~" + hi);
+                }
+            }
+        }
     }
 
     @Test
     void surroundingsStatsUseOnlyTheMargin() {
-        int w = 10, d = 10, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) ->
-                x >= MARGIN && x < MARGIN + w && z >= MARGIN && z < MARGIN + d ? 300 : 64);
-        TerrainStats band = TerrainStats.ofBand(h, fullW, fullD, MARGIN);
+        int w = 10, d = 10, m = 8, fullW = w + 2 * m, fullD = d + 2 * m;
+        int[] h = grid(fullW, fullD, (x, z) -> x >= m && x < m + w && z >= m && z < m + d ? 300 : 64);
+        TerrainStats band = TerrainStats.ofBand(h, fullW, fullD, m);
         assertEquals(64, band.max());
         assertEquals(64, band.median());
     }
@@ -118,175 +252,13 @@ class TerrainGeneratorTest {
         double[] relief = TerrainGenerator.relief(h, w, d, 12);
         for (int z = 30; z < 50; z++) {
             for (int x = 30; x < 50; x++) {
-                double r = relief[z * w + x];
-                assertTrue(Math.abs(r) < 1.0, "slope leaked into relief: " + r);
+                double v = relief[z * w + x];
+                assertTrue(Math.abs(v) < 1.0, "slope leaked into relief: " + v);
             }
         }
         double spread = 0;
         for (int x = 30; x < 50; x++) spread = Math.max(spread, Math.abs(relief[40 * w + x]));
         assertTrue(spread > 0.3, "bumps were flattened away");
-    }
-
-    @Test
-    void vanillaReferenceDrivesDetail() {
-        int w = 48, d = 48, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] around = grid(fullW, fullD, (x, z) -> 70);
-        // Reference terrain: a mountain slope with small bumps on it.
-        int[] reference = grid(fullW, fullD, (x, z) -> 90 + x / 2 + ((x * 7 + z * 13) % 5 == 0 ? 2 : 0));
-        GeneratePlan plan = TerrainGenerator.plan(around, fullW, fullD, MARGIN, 0, 0, params(70, Double.NaN, 4, 0), reference);
-        assertTrue(plan.vanillaRelief());
-        // The mountain itself must not come through: the centre stays near the target.
-        for (int y : plan.target()) {
-            assertTrue(Math.abs(y - 70) <= 4, "y=" + y);
-        }
-        assertTrue(java.util.Arrays.stream(plan.target()).distinct().count() > 1, "no detail at all");
-    }
-
-    @Test
-    void roughZeroIgnoresReference() {
-        int w = 30, d = 30, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] around = grid(fullW, fullD, (x, z) -> 64);
-        int[] reference = grid(fullW, fullD, (x, z) -> 64 + (x * z) % 3);
-        GeneratePlan plan = TerrainGenerator.plan(around, fullW, fullD, MARGIN, 0, 0, params(64, 0, 4, 2), reference);
-        for (int y : plan.target()) assertEquals(64, y);
-    }
-
-    @Test
-    void flatReferenceFallsBackToNoise() {
-        int w = 30, d = 30, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] flat = grid(fullW, fullD, (x, z) -> 64);
-        GeneratePlan plan = TerrainGenerator.plan(flat, fullW, fullD, MARGIN, 0, 0, params(64, 1, 4, 2), flat);
-        assertFalse(plan.vanillaRelief());
-    }
-
-    @Test
-    void poissonSeamKeepsDetailButMatchesEdge() {
-        int w = 40, d = 40, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] flat = grid(fullW, fullD, (x, z) -> 64);
-        int[] reference = grid(fullW, fullD, (x, z) -> 64 + ((x / 2 + z / 3) % 3));
-        // edge 0: no fade band at all, the seam fix alone must keep the edge in line.
-        int[] target = TerrainGenerator.plan(flat, fullW, fullD, MARGIN, 0, 0, params(64, 1.5, 0, 0), reference).target();
-        // No seam: stepping over the edge is never bigger than the texture's own steps inside.
-        int innerMaxStep = 0;
-        for (int z = 0; z < d; z++) {
-            for (int x = 1; x < w; x++) {
-                innerMaxStep = Math.max(innerMaxStep, Math.abs(target[z * w + x] - target[z * w + x - 1]));
-            }
-        }
-        for (int z = 0; z < d; z++) {
-            assertTrue(Math.abs(target[z * w] - 64) <= innerMaxStep, "left edge z=" + z);
-            assertTrue(Math.abs(target[z * w + w - 1] - 64) <= innerMaxStep, "right edge z=" + z);
-        }
-        // Texture survives one block in from the edge (it used to be faded to nothing there).
-        long distinctNearEdge = java.util.stream.IntStream.range(0, d).map(z -> target[z * w + 2]).distinct().count();
-        assertTrue(distinctNearEdge > 1, "detail faded out near the edge");
-    }
-
-    @Test
-    void thermalErosionCapsSlopes() {
-        // A 30-block drop with a 30-block edge band fits one block per column.
-        int w = 80, d = 80, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) -> 90);
-        GenerateParams p = new GenerateParams(60, 0, 48, 30, 0, 1.0, 1L, -64, 319);
-        int[] target = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p).target();
-        for (int z = 0; z < d; z++) {
-            assertTrue(Math.abs(target[z * w] - 90) <= 1, "edge must meet the 90-high surroundings");
-            for (int x = 1; x < w; x++) {
-                int step = Math.abs(target[z * w + x] - target[z * w + x - 1]);
-                assertTrue(step <= 1, "step " + step + " at (" + x + "," + z + ")");
-            }
-        }
-        for (int z = 30; z < d - 30; z++) {
-            for (int x = 30; x < w - 30; x++) assertEquals(60, target[z * w + x], "plateau at (" + x + "," + z + ")");
-        }
-    }
-
-    @Test
-    void plateauRisesToTargetEvenWhenBandIsShort() {
-        // 25 blocks up with only a 6-block band: the ramp gets steeper, the plateau never sinks.
-        int w = 40, d = 40, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) -> 64);
-        GenerateParams p = new GenerateParams(89, 0, 48, edge, 2, 1.0, 1L, -64, 319);
-        int[] target = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p).target();
-        for (int z = edge; z < d - edge; z++) {
-            for (int x = edge; x < w - edge; x++) assertEquals(89, target[z * w + x], "(" + x + "," + z + ")");
-        }
-        int row = (d / 2) * w;
-        assertTrue(target[row] < 89 - 10, "outer column must stay near the surroundings: " + target[row]);
-        for (int x = 1; x <= edge; x++) assertTrue(target[row + x] >= target[row + x - 1], "ramp climbs");
-    }
-
-    @Test
-    void ravineOutsideDoesNotDragGroundDown() {
-        int w = 40, d = 40, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        // Flat sea floor at 50 with a 2-wide ravine down to 14 running into the west edge.
-        int[] h = grid(fullW, fullD, (x, z) -> x < MARGIN && (z == 24 || z == 25) ? 14 : 50);
-        int[] target = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, params(50, 0, 6, 0)).target();
-        for (int y : target) assertEquals(50, y);
-    }
-
-    @Test
-    void randomTerrainNeverStepsMoreThanOne() {
-        java.util.Random r = new java.util.Random(5);
-        for (int trial = 0; trial < 100; trial++) {
-            int w = 90 + r.nextInt(50), d = 90 + r.nextInt(50), fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-            double a = r.nextDouble() * 12;
-            int phase = trial;
-            int[] h = grid(fullW, fullD, (x, z) -> 64 + (int) (a * Math.sin(x / 5.0 + phase) + a * Math.cos(z / 7.0)) + r.nextInt(4));
-            int[] reference = grid(fullW, fullD, (x, z) -> 64 + r.nextInt(3));
-            // Band wide enough for the climb, so the slope limit can always hold.
-            GenerateParams p = new GenerateParams(60 + r.nextInt(20), Double.NaN, 48, 40, 2, 1.0, trial, -64, 319);
-            int[] t = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p, r.nextBoolean() ? reference : null).target();
-            for (int z = 0; z < d; z++) {
-                for (int x = 0; x < w; x++) {
-                    if (x > 0) assertTrue(Math.abs(t[z * w + x] - t[z * w + x - 1]) <= 1, "trial " + trial);
-                    if (z > 0) assertTrue(Math.abs(t[z * w + x] - t[(z - 1) * w + x]) <= 1, "trial " + trial);
-                }
-            }
-        }
-    }
-
-    private static GenerateParams range(int lo, int hi, double rough, int edge) {
-        return new GenerateParams(lo, hi, rough, 48, edge, 2, 1.0, 1234L, -64, 319);
-    }
-
-    @Test
-    void equalRangeEndsGiveFlatGround() {
-        // Hilly surroundings and full-strength bumps, yet the inside sits dead flat at 64.
-        int w = 40, d = 40, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] h = grid(fullW, fullD, (x, z) -> 64 + (int) (4 * Math.sin(x / 6.0) + 3 * Math.cos(z / 5.0)));
-        int[] t = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, range(64, 64, 2.0, edge), h).target();
-        for (int z = edge; z < d - edge; z++) {
-            for (int x = edge; x < w - edge; x++) assertEquals(64, t[z * w + x], "(" + x + "," + z + ")");
-        }
-    }
-
-    @Test
-    void rangeKeepsGroundBetweenItsEnds() {
-        int w = 60, d = 50, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-        int[] flat = grid(fullW, fullD, (x, z) -> 62);
-        int[] hills = grid(fullW, fullD, (x, z) -> 60 + x / 3 + (int) (2 * Math.sin(z / 4.0)));
-        for (int[] reference : new int[][] {null, flat, hills}) {
-            int[] t = TerrainGenerator.plan(flat, fullW, fullD, MARGIN, 0, 0, range(61, 64, 1.5, edge), reference).target();
-            java.util.Set<Integer> seen = new java.util.HashSet<>();
-            for (int z = edge; z < d - edge; z++) {
-                for (int x = edge; x < w - edge; x++) {
-                    int y = t[z * w + x];
-                    assertTrue(y >= 61 && y <= 64, "y " + y + " at (" + x + "," + z + ")");
-                    seen.add(y);
-                }
-            }
-            assertTrue(seen.size() >= 3, "range barely used: " + seen);
-        }
-    }
-
-    @Test
-    void islandEdgeWidensForDeepWater() {
-        // Sea floor at 40, island top at 70: 30 blocks to climb at <= 1 per block.
-        assertEquals(45, TerrainGenerator.islandEdge(70, 40, 10, 200, 200, 1.0));
-        // Never below the player's smooth setting, never more than half the selection.
-        assertEquals(10, TerrainGenerator.islandEdge(64, 63, 10, 200, 200, 1.0));
-        assertEquals(15, TerrainGenerator.islandEdge(70, 40, 10, 30, 40, 1.0));
     }
 
     @Test

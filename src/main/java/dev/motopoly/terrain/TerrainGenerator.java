@@ -1,37 +1,35 @@
 package dev.motopoly.terrain;
 
 /**
- * Designs brand-new ground for a selection so it reads as part of the
+ * Designs brand-new ground for a selection and blends it into the
  * surrounding landscape.
  *
- * <p>Whatever is inside the selection now (buildings, water, holes) is ignored.
- * The new surface is built only from the terrain just outside it:
+ * <p>The selection is the generating zone. Whatever is inside it now
+ * (buildings, water, holes) is ignored:
  * <ol>
- *   <li><b>Membrane.</b> The ring of columns bordering the selection is held
- *       fixed and the inside is solved as a harmonic surface (Laplace's
- *       equation, via SOR). That is the smoothest surface that touches every
- *       edge, so slopes on one side fade naturally into the other.</li>
- *   <li><b>Target level.</b> If a base Y is given, the surface eases from the
- *       membrane at the edge to that level over the {@code edge} band. With a
- *       height range instead, the level itself rolls between its two ends,
+ *   <li><b>Zone.</b> With a single level the whole selection is dead flat at
+ *       that Y. With a height range the level rolls between its two ends,
  *       following the large shapes of the vanilla terrain there (or slow
- *       noise), and the ground inside never leaves the range.</li>
- *   <li><b>Natural detail.</b> Preferably the real thing: the heightmap the
- *       vanilla generator produces for these very coordinates, high-pass
- *       filtered so only the small bumps remain (no mountains or valleys).
- *       Without a reference, a stand-in: vanilla plains are the high-erosion
- *       case of the density function, i.e. low-amplitude octave noise, so
- *       that noise is used, modulated by a slower "erosion" noise. Either way
- *       the detail is pasted with Poisson seamless cloning, so it reaches the
- *       edge and still lines up with the surroundings.</li>
- *   <li>A light blur, thermal erosion to cap slopes, then rounding to whole blocks.
- *       Inside the edge band the ground is pinned at the target level: the
- *       slope limit shapes the ramp around it and never lowers the plateau.
- *       If the band is too narrow for the climb, the ramp gets steeper.</li>
+ *       noise), plus small natural bumps; the ground never leaves the range
+ *       and keeps to the slope limit.</li>
+ *   <li><b>Natural detail</b> (ranges only). Preferably the real thing: the
+ *       heightmap the vanilla generator produces for these very coordinates,
+ *       high-pass filtered so only the small bumps remain. Without a
+ *       reference, low-amplitude octave noise modulated by a slower "erosion"
+ *       noise, which is what vanilla plains boil down to.</li>
+ *   <li><b>Transition band.</b> A band of {@code edge} columns around the
+ *       selection, outside it, eases from the zone's edge to the existing
+ *       terrain along a smoothstep curve: flat where it leaves the zone, flat
+ *       where it meets the surroundings, so neither side shows a crease.</li>
+ *   <li>Optionally, thermal erosion caps slopes in the band; then everything
+ *       is rounded to whole blocks. The zone is pinned: if the band is too
+ *       narrow for the climb, the ramp simply gets steeper (several blocks
+ *       per column if need be) instead of the zone moving.</li>
  * </ol>
  *
- * <p>Input is the selection plus a margin on every side. The margin is never
- * changed; it supplies the edge values and the roughness analysis.
+ * <p>Input is the selection plus a margin on every side, wider than the band.
+ * Columns beyond the band are never changed; they hold the band's outer end
+ * and supply the roughness analysis.
  */
 public final class TerrainGenerator {
     // Octave noise rarely reaches its theoretical range; this stretches typical
@@ -41,13 +39,12 @@ public final class TerrainGenerator {
     private static final long RANGE_SALT = 0x2545F4914F6CDD1DL;
     // Large vanilla shapes flatter than this inside the selection can't shape a height range.
     private static final double MIN_SHAPE_SPAN = 1.0;
-    private static final double CONVERGED = 0.005;
     // Vanilla relief keeps its natural size under rough=auto, within these bounds.
     private static final double AUTO_RELIEF_MIN = 0.4;
     private static final double AUTO_RELIEF_MAX = 2.5;
     // 5x5 median: removes holes and spikes up to two blocks wide, keeps real slopes.
     private static final int DESPIKE_RADIUS = 2;
-    // A pinned plateau this far outside the ring's cones still rounds to a one-block ramp.
+    // A pinned zone this far outside the ring's cones still rounds to a one-block ramp.
     private static final double FIT_SLACK = 0.5;
 
     private TerrainGenerator() {
@@ -57,7 +54,7 @@ public final class TerrainGenerator {
      * @param heights surface Y over the expanded grid, row-major; only the margin is read
      * @param fullW   expanded grid width  (selection width  + 2 * margin)
      * @param fullD   expanded grid depth  (selection depth  + 2 * margin)
-     * @param margin  margin width on each side, at least 1
+     * @param margin  margin width on each side, at least 1; the band is at most {@code margin - 1}
      * @param originX world X of the expanded grid's first column
      * @param originZ world Z of the expanded grid's first row
      */
@@ -83,118 +80,95 @@ public final class TerrainGenerator {
         if (margin < 1 || w <= 0 || d <= 0) {
             throw new IllegalArgumentException("need margin >= 1 and a selection of at least 1x1");
         }
-        // The innermost columns always get the full target level, even when the band is wider than the selection allows.
-        int edge = Math.min(params.edge(), (Math.min(w, d) - 1) / 2);
-        // A ravine or cave mouth just outside would otherwise drag the new ground down into it.
+        // At least one fixed column must stay beyond the band to hold its outer end.
+        int band = Math.min(params.edge(), margin - 1);
+        int ring = margin - band;
+        // A ravine or cave mouth just outside would otherwise drag the band down into it.
         heights = despikeMargin(heights, fullW, fullD, margin, DESPIKE_RADIUS);
 
         TerrainStats around = TerrainStats.ofBand(heights, fullW, fullD, margin);
 
-        // Natural detail over the whole expanded grid (the ring is needed for the seam fix below).
-        double[] detail = new double[fullW * fullD];
-        double roughness;
+        double[] zone = new double[w * d];
+        double roughness = 0;
         boolean vanilla = false;
-        double[] relief = reference == null ? null : relief(reference, fullW, fullD, reliefRadius(params.scale()));
-        double reliefSize = relief == null ? 0 : innerPercentile95(relief, fullW, fullD, margin);
-        if (relief != null && reliefSize > 1e-6) {
-            vanilla = true;
-            roughness = Double.isNaN(params.roughness())
-                    ? clamp(reliefSize, AUTO_RELIEF_MIN, AUTO_RELIEF_MAX) : params.roughness();
-            for (int i = 0; i < detail.length; i++) {
-                detail[i] = roughness * clamp(relief[i] / reliefSize, -1.5, 1.5);
-            }
+        if (params.isFlat()) {
+            java.util.Arrays.fill(zone, params.lowY());
         } else {
-            roughness = Double.isNaN(params.roughness()) ? autoRoughness(around) : params.roughness();
-            OctaveNoise noise = new OctaveNoise(params.seed(), 4);
-            OctaveNoise erosion = new OctaveNoise(params.seed() ^ EROSION_SALT, 2);
-            for (int z = 0; z < fullD; z++) {
-                for (int x = 0; x < fullW; x++) {
-                    int wx = originX + x;
-                    int wz = originZ + z;
-                    double n = clamp(noise.sample(wx / params.scale(), wz / params.scale()) * NOISE_GAIN, -1, 1);
-                    double e = erosion.sample(wx / (params.scale() * 4), wz / (params.scale() * 4));
-                    detail[z * fullW + x] = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5)) * n;
-                }
+            // One blur of the reference feeds both the large shapes and, subtracted, the small bumps.
+            double[] hills = reference == null ? null : lowPass(reference, fullW, fullD, reliefRadius(params.scale()));
+            double[] relief = null;
+            if (hills != null) {
+                relief = new double[hills.length];
+                for (int i = 0; i < relief.length; i++) relief[i] = reference[i] - hills[i];
             }
-        }
-
-        double[] boundary = new double[fullW * fullD];
-        for (int i = 0; i < boundary.length; i++) boundary[i] = heights[i];
-        double[] field = membrane(boundary, fullW, fullD, margin, w, d);
-        double[] levels = params.topY() == null ? null : rangeLevels(params.baseY(), params.topY(),
-                reference, fullW, fullD, margin, originX, originZ, params.scale(), params.seed());
-        for (int z = 0; z < d; z++) {
-            for (int x = 0; x < w; x++) {
-                int fi = (z + margin) * fullW + (x + margin);
-                if (params.baseY() != null) {
-                    double level = levels == null ? params.baseY() : levels[z * w + x];
-                    double t = edgeWeight(x, z, w, d, edge);
-                    field[fi] += (level - field[fi]) * t;
-                }
+            double reliefSize = relief == null ? 0 : innerPercentile95(relief, fullW, fullD, margin);
+            vanilla = reliefSize > 1e-6;
+            OctaveNoise noise = null;
+            OctaveNoise erosion = null;
+            if (vanilla) {
+                roughness = Double.isNaN(params.roughness())
+                        ? clamp(reliefSize, AUTO_RELIEF_MIN, AUTO_RELIEF_MAX) : params.roughness();
+            } else {
+                roughness = Double.isNaN(params.roughness()) ? autoRoughness(around) : params.roughness();
+                noise = new OctaveNoise(params.seed(), 4);
+                erosion = new OctaveNoise(params.seed() ^ EROSION_SALT, 2);
             }
-        }
-
-        double[] base = field.clone();
-        // Poisson seamless cloning (Pérez et al. 2003): paste the detail at full
-        // strength right up to the edge, then add the harmonic correction that
-        // cancels it on the boundary ring. The seam vanishes while the texture
-        // keeps its gradients, instead of fading out across the edge band.
-        double[] seam = new double[fullW * fullD];
-        for (int i = 0; i < seam.length; i++) seam[i] = -detail[i];
-        double[] correction = membrane(seam, fullW, fullD, margin, w, d);
-        for (int z = margin; z < margin + d; z++) {
-            for (int x = margin; x < margin + w; x++) {
-                int fi = z * fullW + x;
-                field[fi] += detail[fi] + correction[fi];
-            }
-        }
-
-        double[] blurredBase = base;
-        for (int pass = 0; pass < params.smoothPasses(); pass++) {
-            field = blur(field, fullW, fullD, margin);
-            blurredBase = blur(blurredBase, fullW, fullD, margin);
-        }
-        if (params.baseY() != null) {
-            // Blurring would pull the plateau's rim toward the ramp: the level stays, only the bumps are softened.
-            for (int z = edge; z < d - edge; z++) {
-                for (int x = edge; x < w - edge; x++) {
-                    int fi = (z + margin) * fullW + (x + margin);
-                    field[fi] += base[fi] - blurredBase[fi];
-                }
-            }
-        }
-        if (params.topY() != null) {
-            // Bumps may not poke out of the range; the edge band still eases into the surroundings.
+            double[] levels = rangeLevels(params.lowY(), params.highY(),
+                    hills, fullW, fullD, margin, originX, originZ, params.scale(), params.seed());
             for (int z = 0; z < d; z++) {
                 for (int x = 0; x < w; x++) {
-                    int fi = (z + margin) * fullW + (x + margin);
-                    double v = field[fi];
-                    field[fi] += (clamp(v, params.baseY(), params.topY()) - v) * edgeWeight(x, z, w, d, edge);
-                }
-            }
-        }
-        if (params.maxStep() > 0) {
-            boolean[] pinned = null;
-            if (params.baseY() != null) {
-                pinned = new boolean[fullW * fullD];
-                for (int z = 0; z < d; z++) {
-                    for (int x = 0; x < w; x++) {
-                        int dist = Math.min(Math.min(x, z), Math.min(w - 1 - x, d - 1 - z));
-                        pinned[(z + margin) * fullW + (x + margin)] = dist >= edge;
+                    double detail;
+                    if (vanilla) {
+                        detail = roughness * clamp(relief[(z + margin) * fullW + (x + margin)] / reliefSize, -1.5, 1.5);
+                    } else {
+                        int wx = originX + margin + x;
+                        int wz = originZ + margin + z;
+                        double n = clamp(noise.sample(wx / params.scale(), wz / params.scale()) * NOISE_GAIN, -1, 1);
+                        double e = erosion.sample(wx / (params.scale() * 4), wz / (params.scale() * 4));
+                        detail = roughness * (0.35 + 0.65 * smoothstep((e + 1) * 0.5)) * n;
                     }
+                    zone[z * w + x] = levels[z * w + x] + detail;
                 }
             }
-            thermalErosion(field, fullW, fullD, margin, params.maxStep(), pinned);
+            for (int pass = 0; pass < params.smoothPasses(); pass++) zone = blurZone(zone, w, d);
+            for (int i = 0; i < zone.length; i++) zone[i] = clamp(zone[i], params.lowY(), params.highY());
+            // Cutting only lowers ground toward a neighbour, so it stays inside the range.
+            if (params.maxStep() > 0) capSlopes(zone, w, d, talus(params.maxStep()));
         }
 
-        int[] target = new int[w * d];
-        for (int z = 0; z < d; z++) {
-            for (int x = 0; x < w; x++) {
-                int y = (int) Math.round(field[(z + margin) * fullW + (x + margin)]);
-                target[z * w + x] = Math.max(params.minY(), Math.min(params.maxY(), y));
+        // The band eases from the zone's nearest edge column to the existing ground.
+        double[] field = new double[fullW * fullD];
+        for (int i = 0; i < field.length; i++) field[i] = heights[i];
+        boolean[] pinned = new boolean[fullW * fullD];
+        for (int z = -band; z < d + band; z++) {
+            for (int x = -band; x < w + band; x++) {
+                int fi = (z + margin) * fullW + (x + margin);
+                int cx = clampIndex(x, w);
+                int cz = clampIndex(z, d);
+                double inner = zone[cz * w + cx];
+                if (cx == x && cz == z) {
+                    field[fi] = inner;
+                    pinned[fi] = true;
+                    continue;
+                }
+                double t = smoothstep(Math.min(1.0, Math.hypot(x - cx, z - cz) / (band + 1.0)));
+                field[fi] = inner + (heights[fi] - inner) * t;
             }
         }
-        return new GeneratePlan(target, roughness, around, vanilla);
+        if (params.maxStep() > 0 && band > 0) {
+            thermalErosion(field, fullW, fullD, ring, params.maxStep(), pinned);
+        }
+
+        int bw = w + 2 * band;
+        int bd = d + 2 * band;
+        int[] target = new int[bw * bd];
+        for (int z = 0; z < bd; z++) {
+            for (int x = 0; x < bw; x++) {
+                int y = (int) Math.round(field[(z + ring) * fullW + (x + ring)]);
+                target[z * bw + x] = Math.max(params.minY(), Math.min(params.maxY(), y));
+            }
+        }
+        return new GeneratePlan(target, band, roughness, around, vanilla);
     }
 
     /**
@@ -263,8 +237,10 @@ public final class TerrainGenerator {
      * selection: the large vanilla shapes at these coordinates (or slow noise
      * when there are none) stretched so the lowest spot sits at {@code lo} and
      * the highest at {@code hi}.
+     *
+     * @param hills low-passed reference heightmap over the expanded grid, or {@code null}
      */
-    static double[] rangeLevels(int lo, int hi, int[] reference, int fullW, int fullD, int margin,
+    static double[] rangeLevels(int lo, int hi, double[] hills, int fullW, int fullD, int margin,
                                 int originX, int originZ, double scale, long seed) {
         int w = fullW - 2 * margin;
         int d = fullD - 2 * margin;
@@ -273,7 +249,6 @@ public final class TerrainGenerator {
             java.util.Arrays.fill(shape, lo);
             return shape;
         }
-        double[] hills = reference == null ? null : lowPass(reference, fullW, fullD, reliefRadius(scale));
         if (hills != null) {
             for (int z = 0; z < d; z++) {
                 for (int x = 0; x < w; x++) shape[z * w + x] = hills[(z + margin) * fullW + (x + margin)];
@@ -346,50 +321,31 @@ public final class TerrainGenerator {
         return abs[Math.min(abs.length - 1, (int) Math.floor(abs.length * 0.95))];
     }
 
-    /**
-     * Harmonic surface over the selection with the bordering ring as fixed
-     * boundary. Starts from a transfinite blend of the four edges, which is
-     * already close, then relaxes with successive over-relaxation.
-     */
-    static double[] membrane(double[] heights, int fullW, int fullD, int margin, int w, int d) {
-        double[] u = heights.clone();
-        int left = margin - 1;
-        int right = margin + w;
-        int top = margin - 1;
-        int bottom = margin + d;
-        for (int z = 0; z < d; z++) {
-            int row = z + margin;
-            double hl = heights[row * fullW + left];
-            double hr = heights[row * fullW + right];
-            for (int x = 0; x < w; x++) {
-                int col = x + margin;
-                double ht = heights[top * fullW + col];
-                double hb = heights[bottom * fullW + col];
-                double wl = 1.0 / (x + 1);
-                double wr = 1.0 / (w - x);
-                double wt = 1.0 / (z + 1);
-                double wb = 1.0 / (d - z);
-                u[row * fullW + col] = (hl * wl + hr * wr + ht * wt + hb * wb) / (wl + wr + wt + wb);
-            }
-        }
+    /** Slack below the step so rounded heights stay within one step of each other. */
+    private static double talus(double maxStep) {
+        return Math.max(0.05, maxStep - 0.05);
+    }
 
-        int n = Math.max(w, d) + 1;
-        double omega = 2.0 / (1.0 + Math.sin(Math.PI / n));
-        int maxIterations = Math.max(50, 4 * n);
-        for (int iter = 0; iter < maxIterations; iter++) {
-            double maxDelta = 0;
-            for (int z = margin; z < margin + d; z++) {
-                for (int x = margin; x < margin + w; x++) {
-                    int i = z * fullW + x;
-                    double gs = (u[i - 1] + u[i + 1] + u[i - fullW] + u[i + fullW]) * 0.25;
-                    double delta = omega * (gs - u[i]);
-                    u[i] += delta;
-                    maxDelta = Math.max(maxDelta, Math.abs(delta));
-                }
+    /**
+     * Cuts cliffs inside the zone alone, looking only at zone neighbours: every
+     * cell drops to at most its neighbour plus the talus (a min-plus distance
+     * transform; two raster passes are exact on a rectangle).
+     */
+    static void capSlopes(double[] v, int w, int d, double talus) {
+        for (int z = 0; z < d; z++) {
+            for (int x = 0; x < w; x++) {
+                int i = z * w + x;
+                if (x > 0) v[i] = Math.min(v[i], v[i - 1] + talus);
+                if (z > 0) v[i] = Math.min(v[i], v[i - w] + talus);
             }
-            if (maxDelta < CONVERGED) break;
         }
-        return u;
+        for (int z = d - 1; z >= 0; z--) {
+            for (int x = w - 1; x >= 0; x--) {
+                int i = z * w + x;
+                if (x < w - 1) v[i] = Math.min(v[i], v[i + 1] + talus);
+                if (z < d - 1) v[i] = Math.min(v[i], v[i + w] + talus);
+            }
+        }
     }
 
     /**
@@ -410,7 +366,7 @@ public final class TerrainGenerator {
      * is too short for the talus, the talus is relaxed until the climb fits.
      */
     static void thermalErosion(double[] h, int fullW, int fullD, int margin, double maxStep, boolean[] pinned) {
-        double talus = Math.max(0.05, maxStep - 0.05);
+        double talus = talus(maxStep);
         int w = fullW - 2 * margin;
         int d = fullD - 2 * margin;
         double[] upper = new double[h.length];
@@ -436,8 +392,7 @@ public final class TerrainGenerator {
                     h[i] = lo > hi ? (lo + hi) / 2 : clamp(h[i], lo, hi);
                 }
             }
-            // Shaving bumps inside the plateau is fine; its level is already bounded by the ramp.
-            sweep(h, fullW, margin, w, d, talus, true, null);
+            sweep(h, fullW, margin, w, d, talus, true, pinned);
         }
     }
 
@@ -511,45 +466,30 @@ public final class TerrainGenerator {
         return takeMin ? Math.min(a, Math.min(b, c)) : Math.max(a, Math.max(b, c));
     }
 
-    /**
-     * Edge band wide enough to climb from {@code level} (e.g. the sea floor
-     * around an island) to {@code baseY} without exceeding {@code maxStep}:
-     * a smoothstep ramp is 1.5x steeper than linear at its middle. Never
-     * narrower than {@code edge}, never wider than half the selection.
-     */
-    public static int islandEdge(int baseY, double level, int edge, int w, int d, double maxStep) {
-        double slope = maxStep > 0 ? maxStep : 1.0;
-        int needed = (int) Math.ceil(1.5 * Math.abs(baseY - level) / slope);
-        return Math.min(Math.max(edge, needed), Math.max(1, Math.min(w, d) / 2));
-    }
-
     /** Flat land stays nearly flat; rugged surroundings leave gentle bumps. */
     public static double autoRoughness(TerrainStats stats) {
         return clamp(0.4 + 0.5 * stats.roughness(), 0.4, 2.0);
     }
 
-    /** 0 at the outside edge, 1 once {@code edge} blocks in. */
-    static double edgeWeight(int x, int z, int w, int d, int edge) {
-        if (edge == 0) return 1;
-        int dist = Math.min(Math.min(x, z), Math.min(w - 1 - x, d - 1 - z));
-        return smoothstep(Math.min(1.0, (dist + 1.0) / (edge + 1.0)));
-    }
-
-    private static double[] blur(double[] src, int fullW, int fullD, int margin) {
-        double[] out = src.clone();
-        for (int z = margin; z < fullD - margin; z++) {
-            for (int x = margin; x < fullW - margin; x++) {
+    /** 1-2-1 blur over the zone alone; columns outside it don't count. */
+    private static double[] blurZone(double[] src, int w, int d) {
+        double[] out = new double[src.length];
+        for (int z = 0; z < d; z++) {
+            for (int x = 0; x < w; x++) {
                 double sum = 0;
                 double weight = 0;
                 for (int dz = -1; dz <= 1; dz++) {
                     for (int dx = -1; dx <= 1; dx++) {
+                        int xx = x + dx;
+                        int zz = z + dz;
+                        if (xx < 0 || zz < 0 || xx >= w || zz >= d) continue;
                         // 1-2-1 kernel: centre 4, edges 2, corners 1
                         double k = (dx == 0 ? 2 : 1) * (dz == 0 ? 2 : 1);
-                        sum += src[(z + dz) * fullW + (x + dx)] * k;
+                        sum += src[zz * w + xx] * k;
                         weight += k;
                     }
                 }
-                out[z * fullW + x] = sum / weight;
+                out[z * w + x] = sum / weight;
             }
         }
         return out;

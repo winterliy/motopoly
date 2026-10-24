@@ -52,14 +52,16 @@ object GenerateJob {
      * Works out every block edit for [plan]. Reads only from the snapshots in
      * [grid] and [reference], so it is safe to call off the main thread.
      *
-     * Each column: everything above the new surface is removed (or, below
-     * [waterLevel], flooded), the surface gets a material stack, and any air or
-     * water underneath is filled down to solid ground (at most [maxFillDepth]
-     * blocks). The stack is chosen by where the column ends up:
-     * - well under water: the sea floor of the nearest column outside;
+     * Each changed column: everything above the new surface is removed (or,
+     * below [waterLevel], flooded), the surface gets a material stack, and any
+     * air or water underneath is filled down to solid ground (at most
+     * [maxFillDepth] blocks). Band columns that keep their height are left
+     * alone. The stack is chosen by where the column ends up:
+     * - well under water: the sea floor of the nearest column outside the selection;
      * - at the waterline within [beachWidth] blocks of water: sand over sandstone;
-     * - inland: the vanilla [reference] column when it is dry land, else the
-     *   nearest dry column outside, else grass over dirt.
+     * - band columns on dry land: their own original stack and plants;
+     * - selection columns inland: the vanilla [reference] column when it is dry
+     *   land, else the nearest dry column outside, else grass over dirt.
      * Plants come from the reference column, or are scattered over bare grass.
      */
     fun computeChanges(
@@ -69,19 +71,25 @@ object GenerateJob {
     ): ChangeSet {
         val changes = ChangeSet(grid.world.uid)
         val m = grid.margin
+        val band = plan.band()
         val w = grid.width - 2 * m
         val d = grid.depth - 2 * m
+        val bw = w + 2 * band
         val floor = grid.world.minHeight
         val ceiling = grid.world.maxHeight - 1
         val profiles = HashMap<Int, ColumnProfile>()
         val toWater = waterLevel?.let { distanceToWater(grid, plan, it) }
 
-        for (iz in 0 until d) {
-            for (ix in 0 until w) {
+        for (iz in -band until d + band) {
+            for (ix in -band until w + band) {
                 val x = grid.originX + m + ix
                 val z = grid.originZ + m + iz
-                val surface = plan.target()[iz * w + ix]
+                val surface = plan.target()[(iz + band) * bw + (ix + band)]
                 val gi = grid.index(x, z)
+                val inZone = ix in 0 until w && iz in 0 until d
+                // The band only reshapes ground where its height really changes.
+                if (!inZone && surface == grid.heights[gi]) continue
+                val ownDry = !inZone && grid.surface[gi] == grid.heights[gi]
 
                 val (bx, bz) = nearestOutside(ix, iz, w, d)
                 val outsideX = grid.originX + m + bx
@@ -97,15 +105,22 @@ object GenerateJob {
                 val underwater = waterLevel != null && surface < waterLevel - 2
                 val beach = waterLevel != null && !underwater && surface <= waterLevel + 2 &&
                     toWater!![gi] <= beachWidth
+                val own = if (ownDry && !underwater && !beach) {
+                    profiles[gi] ?: profileOf(grid, x, grid.heights[gi], z)?.also { profiles[gi] = it }
+                } else {
+                    null
+                }
                 val profile = when {
                     underwater -> outsideProfile() ?: SEA_FLOOR
                     beach -> BEACH
+                    own != null -> own
                     vanilla -> profileOf(reference, x, refTop, z) ?: MEADOW
                     outsideDry -> outsideProfile() ?: MEADOW
                     else -> MEADOW
                 }
                 val plants = when {
                     !copyPlants || underwater || beach -> emptyList()
+                    own != null -> plantsAbove(grid, x, grid.heights[gi], z)
                     vanilla -> plantsAbove(reference, x, refTop, z)
                     profile.top.material == Material.GRASS_BLOCK -> scatteredPlant(x, z, seed)
                     else -> emptyList()
@@ -138,18 +153,18 @@ object GenerateJob {
 
     /**
      * Blocks from each column to the nearest water, over the whole grid: water
-     * outside the selection, plus selection columns that end up under water.
+     * beyond the band, plus selection and band columns that end up under water.
      */
     private fun distanceToWater(grid: SurfaceGrid, plan: GeneratePlan, waterLevel: Int): IntArray {
-        val m = grid.margin
-        val w = grid.width - 2 * m
+        val o = grid.margin - plan.band()
+        val bw = grid.width - 2 * o
         val dist = IntArray(grid.width * grid.depth) { Int.MAX_VALUE }
         val queue = ArrayDeque<Int>()
         for (z in 0 until grid.depth) {
             for (x in 0 until grid.width) {
                 val i = z * grid.width + x
-                val inner = x in m until grid.width - m && z in m until grid.depth - m
-                val wet = if (inner) plan.target()[(z - m) * w + (x - m)] < waterLevel
+                val planned = x in o until grid.width - o && z in o until grid.depth - o
+                val wet = if (planned) plan.target()[(z - o) * bw + (x - o)] < waterLevel
                           else grid.surface[i] > grid.heights[i]
                 if (wet) {
                     dist[i] = 0
@@ -197,8 +212,12 @@ object GenerateJob {
         }
     }
 
-    /** Column just outside the selection, on the side closest to (ix, iz). Selection-local coordinates. */
+    /**
+     * Column just outside the selection, on the side closest to (ix, iz).
+     * Selection-local coordinates; a band column gets its own spot on that ring.
+     */
     private fun nearestOutside(ix: Int, iz: Int, w: Int, d: Int): Pair<Int, Int> {
+        if (ix !in 0 until w || iz !in 0 until d) return ix.coerceIn(-1, w) to iz.coerceIn(-1, d)
         val toLeft = ix
         val toRight = w - 1 - ix
         val toTop = iz

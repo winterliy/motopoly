@@ -25,13 +25,15 @@ import org.bukkit.persistence.PersistentDataType
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
-private const val MAX_SMOOTH = 64
+private const val MAX_DISTANCE = 64
 private const val MAX_STEP = 16
 private const val BLUR_PASSES = 2
 
 class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: WandListener) : CommandExecutor, TabCompleter {
     private val busy = HashSet<UUID>()
-    private val smoothKey = NamespacedKey(plugin, "smooth")
+    private val distanceKey = NamespacedKey(plugin, "distance")
+    // Before 2.0 the band was called smooth; a saved value still counts.
+    private val legacySmoothKey = NamespacedKey(plugin, "smooth")
     private val roughKey = NamespacedKey(plugin, "rough")
     private val stepKey = NamespacedKey(plugin, "step")
 
@@ -72,17 +74,21 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             """
             <gold>사용 순서</gold>
             <yellow>1.</yellow> <yellow>/$label pos1</yellow>, <yellow>/$label pos2</yellow> <gray>구역 지정 (또는 /$label wand 로 클릭)
-            <yellow>2.</yellow> <yellow>/$label gen [y]</yellow> <gray>구역 땅을 Y 높이로 올리거나 내리고, 주변과 자연스럽게 이어요
-               <gray>y를 빼면 두 지점의 Y를 써요: 같으면 그 높이의 평지, 다르면 그 범위 안에서 높낮이
-            <yellow>3.</yellow> <yellow>/$label config <smooth|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
+            <yellow>2.</yellow> <yellow>/$label gen [y]</yellow> <gray>구역 안을 새 땅으로 채우고, 구역 바깥 경사로 주변과 이어요
+               <gray>두 지점의 Y가 같으면 그 높이의 평지, 다르면 그 범위 안에서 높낮이. y를 주면 그 높이의 평지
+            <yellow>3.</yellow> <yellow>/$label config <distance|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
             <yellow>4.</yellow> <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
             <gray>기타: /$label info (지형 분석), /$label config (현재 설정 보기), /$label reload
             """.trimIndent()
         )
     }
 
-    private fun smoothOf(player: Player): Int =
-        player.persistentDataContainer.get(smoothKey, PersistentDataType.INTEGER) ?: plugin.settings.defaultSmooth
+    private fun distanceOf(player: Player): Int {
+        val pdc = player.persistentDataContainer
+        return pdc.get(distanceKey, PersistentDataType.INTEGER)
+            ?: pdc.get(legacySmoothKey, PersistentDataType.INTEGER)
+            ?: plugin.settings.defaultDistance
+    }
 
     private fun roughOf(player: Player): Double =
         player.persistentDataContainer.get(roughKey, PersistentDataType.DOUBLE) ?: plugin.settings.defaultRough
@@ -94,18 +100,16 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
 
     private fun stepText(step: Int) = if (step == 0) "끔" else "${step}블록"
 
-    private fun targetText(params: GenerateParams): String {
-        val top = params.topY() ?: return "${params.baseY()}"
-        return if (top == params.baseY()) "$top(평지)" else "${params.baseY()}~$top"
-    }
+    private fun targetText(params: GenerateParams): String =
+        if (params.isFlat()) "${params.lowY()}(평지)" else "${params.lowY()}~${params.highY()}"
 
     private fun config(player: Player, label: String, key: String?, value: String?) {
         val pdc = player.persistentDataContainer
         val s = plugin.settings
         when (key?.lowercase()) {
             null -> player.msg(
-                "<white>현재 설정: smooth <aqua>${smoothOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua>, " +
-                    "step <aqua>${stepText(stepOf(player))}</aqua> <gray>(/$label config <smooth|rough|step> [값])"
+                "<white>현재 설정: distance <aqua>${distanceOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua>, " +
+                    "step <aqua>${stepText(stepOf(player))}</aqua> <gray>(/$label config <distance|rough|step> [값])"
             )
             "step" -> when {
                 value == null -> {
@@ -126,19 +130,22 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     player.msg("<green>step: <aqua>${stepText(n)}</aqua> <gray>($note)")
                 }
             }
-            "smooth" -> when {
+            "distance" -> when {
                 value == null -> {
-                    pdc.remove(smoothKey)
-                    player.msg("<green>smooth를 기본값 <aqua>${s.defaultSmooth}</aqua>블록으로 되돌렸어요.")
+                    pdc.remove(distanceKey)
+                    pdc.remove(legacySmoothKey)
+                    player.msg("<green>distance를 기본값 <aqua>${s.defaultDistance}</aqua>블록으로 되돌렸어요.")
                 }
                 else -> {
-                    val n = value.toIntOrNull()?.takeIf { it in 0..MAX_SMOOTH } ?: run {
-                        player.msg("<red>smooth는 0~$MAX_SMOOTH 사이 정수예요.")
+                    val n = value.toIntOrNull()?.takeIf { it in 0..MAX_DISTANCE } ?: run {
+                        player.msg("<red>distance는 0~$MAX_DISTANCE 사이 정수예요.")
                         return
                     }
-                    pdc.set(smoothKey, PersistentDataType.INTEGER, n)
-                    val note = if (n == 0) "테두리부터 바로 목표 높이가 돼요" else "테두리 ${n}블록에 걸쳐 주변 지형에서 목표 높이로 바뀌어요"
-                    player.msg("<green>smooth: <aqua>$n</aqua>블록 <gray>($note)")
+                    pdc.set(distanceKey, PersistentDataType.INTEGER, n)
+                    pdc.remove(legacySmoothKey)
+                    val note = if (n == 0) "구역 바깥은 건드리지 않아요, 경계에 턱이 생길 수 있어요"
+                               else "구역 바깥 ${n}블록에 걸쳐 주변 지형과 이어져요, 높이 차가 크면 경사가 가팔라져요"
+                    player.msg("<green>distance: <aqua>$n</aqua>블록 <gray>($note)")
                 }
             }
             "rough" -> when {
@@ -154,13 +161,14 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     pdc.set(roughKey, PersistentDataType.DOUBLE, r)
                     val note = when {
                         r.isNaN() -> "주변 지형에 맞춰 자동으로 정해요"
-                        r == 0.0 -> "기복 없는 완전 평면이에요"
-                        else -> "최대 ${roughText(r)}블록 높낮이가 생겨요"
+                        r == 0.0 -> "잔 굴곡 없이 큰 높낮이만 있어요"
+                        else -> "최대 ${roughText(r)}블록 잔 굴곡이 생겨요"
                     }
+                    player.msg("<gray>rough는 두 지점의 Y가 다를 때만 써요. 한 층이면 항상 평지예요.")
                     player.msg("<green>rough: <aqua>${roughText(r)}</aqua> <gray>($note)")
                 }
             }
-            else -> player.msg("<red>설정 항목은 smooth, rough, step 중 하나예요.")
+            else -> player.msg("<red>설정 항목은 distance, rough, step 중 하나예요.")
         }
     }
 
@@ -186,7 +194,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val minY = world.minHeight + 1
         val maxY = world.maxHeight - 2
         // Without a height, the two corners' Y set the range: equal means flat, apart means rolling between them.
-        val (low, top) = if (yArg == null) {
+        val (low, high) = if (yArg == null) {
             val range = plugin.selections.of(player.uniqueId).heights(world) ?: run {
                 player.msg("<red>이 월드에서 두 지점을 먼저 찍어 주세요. <gray>(/mt pos1, /mt pos2)")
                 return
@@ -201,11 +209,11 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 player.msg("<red>y는 $minY~$maxY 사이 정수예요. <gray>(/$label gen 만 치면 두 지점의 Y 범위를 써요)")
                 return
             }
-            y to null
+            y to y
         }
         val region = region(player) ?: return
         val params = GenerateParams(
-            low, top, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, stepOf(player).toDouble(),
+            low, high, roughOf(player), plugin.settings.scale, distanceOf(player), BLUR_PASSES, stepOf(player).toDouble(),
             world.seed, minY, maxY,
         )
         generate(player, region, params)
@@ -251,7 +259,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             null
         }
         player.msg("<gray>주변 지형을 분석하고 땅을 설계하는 중...")
-        val margin = settings.analysisMargin
+        // The band plus a fixed ring beyond it that holds the band's outer end.
+        val margin = params.edge() + settings.analysisMargin
         val main = SurfaceScanner.scan(region, margin, plugin.async)
         val ref: CompletableFuture<SurfaceGrid?> = refWorld
             ?.let { SurfaceScanner.scan(region.copy(world = it), margin, plugin.async).thenApply<SurfaceGrid?> { g -> g } }
@@ -268,14 +277,13 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     plugin.slF4JLogger.warn("generate failed", error)
                     return@Runnable
                 }
-                val (plan, changes, used, water) = result
+                val (plan, changes) = result
                 val target = plan.target()
-                val smoothNote = if (used.edge() != params.edge()) "${used.edge()}(섬이라 자동 확장)" else "${used.edge()}"
                 player.msg(
-                    (if (water.island) "<aqua>섬 모드</aqua> <gray>(수면 Y ${water.level})</gray> " else "") +
                         "<white>목표 Y <aqua>${targetText(params)}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
-                        "smooth <aqua>$smoothNote</aqua>, step <aqua>${stepText(used.maxStep().toInt())}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
-                        (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ") +
+                        "distance <aqua>${params.edge()}</aqua>블록, step <aqua>${stepText(params.maxStep().toInt())}</aqua>" +
+                        (if (params.isFlat()) " " else ", 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
+                            (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ")) +
                         "<gray>(블록 변경 ${changes.size}개)"
                 )
                 GenerateJob.apply(plugin, changes, undo = false, blocksPerTick = settings.blocksPerTick,
@@ -317,9 +325,9 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val sub = args[0].lowercase()
         val suggestions = when {
             args.size == 1 -> subcommands
-            sub == "config" && args.size == 2 -> listOf("smooth", "rough", "step")
+            sub == "config" && args.size == 2 -> listOf("distance", "rough", "step")
             sub == "config" && args.size == 3 && args[1].equals("step", true) -> listOf("0", "1", "2", "3")
-            sub == "config" && args.size == 3 && args[1].equals("smooth", true) -> listOf("0", "5", "10", "16")
+            sub == "config" && args.size == 3 && args[1].equals("distance", true) -> listOf("0", "5", "10", "16")
             sub == "config" && args.size == 3 && args[1].equals("rough", true) -> listOf("auto", "0", "1", "2")
             (sub == "gen" || sub == "generate") && args.size == 2 && sender is Player ->
                 listOf((sender.location.blockY - 1).toString())

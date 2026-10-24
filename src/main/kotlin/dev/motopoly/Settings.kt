@@ -8,8 +8,8 @@ data class Settings(
     val analysisMargin: Int,
     val undoDepth: Int,
     val maxFillDepth: Int,
-    /** Edge smoothing width in blocks; players override it with /mt config smooth. */
-    val defaultSmooth: Int,
+    /** Width of the transition band outside the selection; players override it with /mt config distance. */
+    val defaultDistance: Int,
     /** Undulation in blocks, NaN = auto; players override it with /mt config rough. */
     val defaultRough: Double,
     val scale: Double,
@@ -30,7 +30,7 @@ data class Settings(
             analysisMargin = config.getInt("analysis-margin", 8).coerceIn(1, 64),
             undoDepth = config.getInt("undo-depth", 5).coerceAtLeast(0),
             maxFillDepth = config.getInt("max-fill-depth", 64).coerceIn(1, 512),
-            defaultSmooth = config.getInt("defaults.smooth", 10).coerceIn(0, 64),
+            defaultDistance = config.getInt("defaults.distance", config.getInt("defaults.smooth", 10)).coerceIn(0, 64),
             defaultRough = parseRough(config.getString("defaults.rough", "auto")!!) ?: Double.NaN,
             scale = config.getDouble("scale", 48.0).coerceAtLeast(1.0),
             referenceTerrain = config.getBoolean("reference-terrain", true),
