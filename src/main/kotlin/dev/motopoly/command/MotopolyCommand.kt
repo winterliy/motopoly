@@ -27,6 +27,7 @@ import java.util.concurrent.CompletableFuture
 
 private const val MAX_DISTANCE = 64
 private const val MAX_STEP = 16
+private const val MAX_ROUND = 100
 private const val BLUR_PASSES = 2
 
 class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: WandListener) : CommandExecutor, TabCompleter {
@@ -34,6 +35,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private val distanceKey = NamespacedKey(plugin, "distance")
     // Before 2.0 the band was called smooth; a saved value still counts.
     private val legacySmoothKey = NamespacedKey(plugin, "smooth")
+    private val roundKey = NamespacedKey(plugin, "round")
     private val roughKey = NamespacedKey(plugin, "rough")
     private val stepKey = NamespacedKey(plugin, "step")
 
@@ -76,7 +78,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             <yellow>1.</yellow> <yellow>/$label pos1</yellow>, <yellow>/$label pos2</yellow> <gray>구역 지정 (또는 /$label wand 로 클릭)
             <yellow>2.</yellow> <yellow>/$label gen [y]</yellow> <gray>구역 안을 새 땅으로 채우고, 구역 바깥 경사로 주변과 이어요
                <gray>두 지점의 Y가 같으면 그 높이의 평지, 다르면 그 범위 안에서 높낮이. y를 주면 그 높이의 평지
-            <yellow>3.</yellow> <yellow>/$label config <distance|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
+            <yellow>3.</yellow> <yellow>/$label config <distance|round|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
             <yellow>4.</yellow> <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
             <gray>기타: /$label info (지형 분석), /$label config (현재 설정 보기), /$label reload
             """.trimIndent()
@@ -89,6 +91,9 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             ?: pdc.get(legacySmoothKey, PersistentDataType.INTEGER)
             ?: plugin.settings.defaultDistance
     }
+
+    private fun roundOf(player: Player): Int =
+        player.persistentDataContainer.get(roundKey, PersistentDataType.INTEGER) ?: plugin.settings.defaultRound
 
     private fun roughOf(player: Player): Double =
         player.persistentDataContainer.get(roughKey, PersistentDataType.DOUBLE) ?: plugin.settings.defaultRough
@@ -108,8 +113,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val s = plugin.settings
         when (key?.lowercase()) {
             null -> player.msg(
-                "<white>현재 설정: distance <aqua>${distanceOf(player)}</aqua>블록, rough <aqua>${roughText(roughOf(player))}</aqua>, " +
-                    "step <aqua>${stepText(stepOf(player))}</aqua> <gray>(/$label config <distance|rough|step> [값])"
+                "<white>현재 설정: distance <aqua>${distanceOf(player)}</aqua>블록, round <aqua>${roundOf(player)}</aqua>, rough <aqua>${roughText(roughOf(player))}</aqua>, " +
+                    "step <aqua>${stepText(stepOf(player))}</aqua> <gray>(/$label config <distance|round|rough|step> [값])"
             )
             "step" -> when {
                 value == null -> {
@@ -146,6 +151,25 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                     val note = if (n == 0) "구역 바깥은 건드리지 않아요, 경계에 턱이 생길 수 있어요"
                                else "구역 바깥 ${n}블록에 걸쳐 주변 지형과 이어져요, 높이 차가 크면 경사가 가팔라져요"
                     player.msg("<green>distance: <aqua>$n</aqua>블록 <gray>($note)")
+                }
+            }
+            "round" -> when {
+                value == null -> {
+                    pdc.remove(roundKey)
+                    player.msg("<green>round를 기본값 <aqua>${s.defaultRound}</aqua>(으)로 되돌렸어요.")
+                }
+                else -> {
+                    val n = value.toIntOrNull()?.takeIf { it in 0..MAX_ROUND } ?: run {
+                        player.msg("<red>round는 0~$MAX_ROUND 사이 정수예요. (0이면 네모, 100이면 가장 둥글게)")
+                        return
+                    }
+                    pdc.set(roundKey, PersistentDataType.INTEGER, n)
+                    val note = when (n) {
+                        0 -> "구역 모서리를 그대로 네모나게 둬요"
+                        MAX_ROUND -> "모서리 반지름이 짧은 변의 절반이에요, 정사각형 구역이면 원이 돼요"
+                        else -> "모서리 반지름이 짧은 변 절반의 ${n}%예요"
+                    }
+                    player.msg("<green>round: <aqua>$n</aqua> <gray>($note)")
                 }
             }
             "rough" -> when {
@@ -214,7 +238,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val region = region(player) ?: return
         val params = GenerateParams(
             low, high, roughOf(player), plugin.settings.scale, distanceOf(player), BLUR_PASSES, stepOf(player).toDouble(),
-            world.seed, minY, maxY,
+            world.seed, minY, maxY, roundOf(player),
         )
         generate(player, region, params)
     }
@@ -281,7 +305,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 val target = plan.target()
                 player.msg(
                         "<white>목표 Y <aqua>${targetText(params)}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
-                        "distance <aqua>${params.edge()}</aqua>블록, step <aqua>${stepText(params.maxStep().toInt())}</aqua>" +
+                        "distance <aqua>${params.edge()}</aqua>블록, round <aqua>${params.round()}</aqua>, step <aqua>${stepText(params.maxStep().toInt())}</aqua>" +
                         (if (params.isFlat()) " " else ", 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
                             (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ")) +
                         "<gray>(블록 변경 ${changes.size}개)"
@@ -325,9 +349,10 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val sub = args[0].lowercase()
         val suggestions = when {
             args.size == 1 -> subcommands
-            sub == "config" && args.size == 2 -> listOf("distance", "rough", "step")
+            sub == "config" && args.size == 2 -> listOf("distance", "round", "rough", "step")
             sub == "config" && args.size == 3 && args[1].equals("step", true) -> listOf("0", "1", "2", "3")
             sub == "config" && args.size == 3 && args[1].equals("distance", true) -> listOf("0", "5", "10", "16")
+            sub == "config" && args.size == 3 && args[1].equals("round", true) -> listOf("0", "25", "50", "100")
             sub == "config" && args.size == 3 && args[1].equals("rough", true) -> listOf("auto", "0", "1", "2")
             (sub == "gen" || sub == "generate") && args.size == 2 && sender is Player ->
                 listOf((sender.location.blockY - 1).toString())

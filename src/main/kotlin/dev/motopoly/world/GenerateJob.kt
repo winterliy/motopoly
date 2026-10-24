@@ -93,7 +93,7 @@ object GenerateJob {
                 val z = grid.originZ + m + iz
                 val surface = plan.target()[(iz + band) * bw + (ix + band)]
                 val gi = grid.index(x, z)
-                val inZone = ix in 0 until w && iz in 0 until d
+                val inZone = plan.zone()[(iz + band) * bw + (ix + band)]
                 // The band only reshapes ground where its height really changes.
                 if (!inZone && surface == grid.heights[gi]) continue
                 val ownDry = !inZone && grid.surface[gi] == grid.heights[gi]

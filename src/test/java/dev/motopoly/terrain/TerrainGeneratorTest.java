@@ -262,6 +262,29 @@ class TerrainGeneratorTest {
     }
 
     @Test
+    void roundCutsCornersIntoTheBand() {
+        // Square selection at 70 in 60-high surroundings; round 100 makes the zone a circle.
+        int w = 41, d = 41, band = 6, margin = band + RING, fullW = w + 2 * margin, fullD = d + 2 * margin;
+        int[] h = grid(fullW, fullD, (x, z) -> 60);
+        GenerateParams p = new GenerateParams(70, 70, 0, 48, band, 2, 1.0, 1234L, -64, 319, 100);
+        GeneratePlan plan = TerrainGenerator.plan(h, fullW, fullD, margin, 0, 0, p);
+        int bw = w + 2 * band;
+        java.util.function.IntBinaryOperator at = (x, z) -> plan.target()[(z + band) * bw + (x + band)];
+        java.util.function.BiPredicate<Integer, Integer> zone = (x, z) -> plan.zone()[(z + band) * bw + (x + band)];
+        assertEquals(70, at.applyAsInt(20, 20));
+        assertEquals(70, at.applyAsInt(0, 20), "edge middle stays in the zone");
+        assertTrue(zone.test(0, 20) && zone.test(20, 0));
+        assertFalse(zone.test(0, 0), "corner is cut off");
+        assertEquals(60, at.applyAsInt(0, 0), "far corner keeps the surroundings' height");
+        assertTrue(at.applyAsInt(6, 6) > 60 && at.applyAsInt(6, 6) <= 70, "corner ramps between the two");
+        // Round 0 keeps the old square zone.
+        GeneratePlan square = TerrainGenerator.plan(h, fullW, fullD, margin, 0, 0,
+                new GenerateParams(70, 70, 0, 48, band, 2, 1.0, 1234L, -64, 319, 0));
+        assertEquals(70, square.target()[band * bw + band]);
+        assertTrue(square.zone()[band * bw + band]);
+    }
+
+    @Test
     void autoRoughnessTracksSurroundings() {
         assertEquals(0.4, TerrainGenerator.autoRoughness(new TerrainStats(60, 62, 61, 61, 0.5, 0.0)), 1e-9);
         assertEquals(2.0, TerrainGenerator.autoRoughness(new TerrainStats(60, 120, 90, 90, 20, 8.0)), 1e-9);

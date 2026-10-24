@@ -18,9 +18,12 @@ package dev.motopoly.terrain;
  *       reference, low-amplitude octave noise modulated by a slower "erosion"
  *       noise, which is what vanilla plains boil down to.</li>
  *   <li><b>Transition band.</b> A band of {@code edge} columns around the
- *       selection, outside it, eases from the zone's edge to the existing
+ *       zone eases from the zone's edge to the existing
  *       terrain along a smoothstep curve: flat where it leaves the zone, flat
- *       where it meets the surroundings, so neither side shows a crease.</li>
+ *       where it meets the surroundings, so neither side shows a crease.
+ *       With {@code round} the zone's corners are rounded off; those
+ *       selection corners belong to the band and keep their own ground
+ *       wherever it lies farther out than the band.</li>
  *   <li>Optionally, thermal erosion caps slopes in the band; then everything
  *       is rounded to whole blocks. The zone is pinned: if the band is too
  *       narrow for the climb, the ramp simply gets steeper (several blocks
@@ -46,6 +49,8 @@ public final class TerrainGenerator {
     private static final int DESPIKE_RADIUS = 2;
     // A pinned zone this far outside the ring's cones still rounds to a one-block ramp.
     private static final double FIT_SLACK = 0.5;
+    // Columns whose centre lies this close outside a rounded corner still count as zone: smoother outline.
+    private static final double ROUND_SLACK = 0.5;
 
     private TerrainGenerator() {
     }
@@ -137,21 +142,34 @@ public final class TerrainGenerator {
         }
 
         // The band eases from the zone's nearest edge column to the existing ground.
+        // The zone is the selection as a rounded rectangle: the inner rectangle grown by the corner radius.
+        double radius = params.cornerRadius(w, d);
+        int bw = w + 2 * band;
+        int bd = d + 2 * band;
+        boolean[] inZone = new boolean[bw * bd];
         double[] field = new double[fullW * fullD];
         for (int i = 0; i < field.length; i++) field[i] = heights[i];
         boolean[] pinned = new boolean[fullW * fullD];
         for (int z = -band; z < d + band; z++) {
             for (int x = -band; x < w + band; x++) {
                 int fi = (z + margin) * fullW + (x + margin);
-                int cx = clampIndex(x, w);
-                int cz = clampIndex(z, d);
-                double inner = zone[cz * w + cx];
-                if (cx == x && cz == z) {
-                    field[fi] = inner;
+                double px = clamp(x, radius, w - 1 - radius);
+                double pz = clamp(z, radius, d - 1 - radius);
+                double dist = Math.hypot(x - px, z - pz);
+                double gap = dist - radius;
+                boolean inside = x >= 0 && x < w && z >= 0 && z < d && gap <= ROUND_SLACK;
+                if (inside) {
+                    field[fi] = zone[z * w + x];
                     pinned[fi] = true;
+                    inZone[(z + band) * bw + (x + band)] = true;
                     continue;
                 }
-                double t = smoothstep(Math.min(1.0, Math.hypot(x - cx, z - cz) / (band + 1.0)));
+                // Nearest point on the zone's outline.
+                double k = dist > 0 ? radius / dist : 0;
+                int cx = clampIndex((int) Math.round(px + (x - px) * k), w);
+                int cz = clampIndex((int) Math.round(pz + (z - pz) * k), d);
+                double inner = zone[cz * w + cx];
+                double t = band == 0 ? 1 : smoothstep(Math.min(1.0, gap / (band + 1.0)));
                 field[fi] = inner + (heights[fi] - inner) * t;
             }
         }
@@ -159,8 +177,6 @@ public final class TerrainGenerator {
             thermalErosion(field, fullW, fullD, ring, params.maxStep(), pinned);
         }
 
-        int bw = w + 2 * band;
-        int bd = d + 2 * band;
         int[] target = new int[bw * bd];
         for (int z = 0; z < bd; z++) {
             for (int x = 0; x < bw; x++) {
@@ -168,7 +184,7 @@ public final class TerrainGenerator {
                 target[z * bw + x] = Math.max(params.minY(), Math.min(params.maxY(), y));
             }
         }
-        return new GeneratePlan(target, band, roughness, around, vanilla);
+        return new GeneratePlan(target, band, inZone, roughness, around, vanilla);
     }
 
     /**
