@@ -1,6 +1,7 @@
 package dev.motopoly.world
 
 import dev.motopoly.terrain.GeneratePlan
+import dev.motopoly.terrain.OctaveNoise
 import dev.motopoly.terrain.OreTable
 import org.bukkit.Bukkit
 import org.bukkit.Material
@@ -20,7 +21,10 @@ object GenerateJob {
     private val BEACH = ColumnProfile(
         Material.SAND.createBlockData(), Material.SAND.createBlockData(), 3, Material.SANDSTONE.createBlockData()
     )
-    // Sea floor where the neighbouring floor can't be copied (it opens into a cave).
+    private val RED_BEACH = ColumnProfile(
+        Material.RED_SAND.createBlockData(), Material.RED_SAND.createBlockData(), 3, Material.RED_SANDSTONE.createBlockData()
+    )
+    // Sea floor where no floor nearby can be copied (it all opens into caves).
     private val SEA_FLOOR = ColumnProfile(
         Material.SAND.createBlockData(), Material.SAND.createBlockData(), 2, Material.GRAVEL.createBlockData()
     )
@@ -57,8 +61,10 @@ object GenerateJob {
      * air or water underneath is filled down to solid ground (at most
      * [maxFillDepth] blocks). Band columns that keep their height are left
      * alone. The stack is chosen by where the column ends up:
-     * - well under water: the sea floor of the nearest column outside the selection;
-     * - at the waterline within [beachWidth] blocks of water: sand over sandstone;
+     * - under water: the floor of the nearest real sea, river or lake bed, in
+     *   noise-warped patches so sand, gravel, clay and dirt meet in natural blobs;
+     * - at the waterline within [beachWidth] blocks of water, where that bed is
+     *   sand: sand over sandstone (red sand over red sandstone);
      * - band columns on dry land: their own original stack and plants;
      * - selection columns inland: the vanilla [reference] column when it is dry
      *   land, else the nearest dry column outside, else grass over dirt.
@@ -79,6 +85,7 @@ object GenerateJob {
         val ceiling = grid.world.maxHeight - 1
         val profiles = HashMap<Int, ColumnProfile>()
         val toWater = waterLevel?.let { distanceToWater(grid, plan, it) }
+        val seabed = waterLevel?.let { Seabed(grid, seed) { x, y, z -> floorProfile(grid, x, y, z) } }
 
         for (iz in -band until d + band) {
             for (ix in -band until w + band) {
@@ -102,17 +109,18 @@ object GenerateJob {
                 // Same coordinates in the twin world; dry land there means its column is usable.
                 val refTop = reference?.heights?.get(gi)
                 val vanilla = refTop != null && reference.surface[gi] == refTop
-                val underwater = waterLevel != null && surface < waterLevel - 2
-                val beach = waterLevel != null && !underwater && surface <= waterLevel + 2 &&
-                    toWater!![gi] <= beachWidth
+                val underwater = waterLevel != null && surface < waterLevel
+                val bed = if (seabed != null && (underwater || surface <= waterLevel!! + 2)) seabed.profileAt(x, z) else null
+                val sand = bed?.top?.material?.takeIf { it == Material.SAND || it == Material.RED_SAND }
+                val beach = sand != null && !underwater && surface <= waterLevel!! + 2 && toWater!![gi] <= beachWidth
                 val own = if (ownDry && !underwater && !beach) {
                     profiles[gi] ?: profileOf(grid, x, grid.heights[gi], z)?.also { profiles[gi] = it }
                 } else {
                     null
                 }
                 val profile = when {
-                    underwater -> outsideProfile() ?: SEA_FLOOR
-                    beach -> BEACH
+                    underwater -> bed ?: SEA_FLOOR
+                    beach -> if (sand == Material.RED_SAND) RED_BEACH else BEACH
                     own != null -> own
                     vanilla -> profileOf(reference, x, refTop, z) ?: MEADOW
                     outsideDry -> outsideProfile() ?: MEADOW
@@ -242,6 +250,12 @@ object GenerateJob {
         return plants
     }
 
+    /** A bed's stack, for [Seabed]; grass and paths drowned there become plain dirt. */
+    private fun floorProfile(grid: SurfaceGrid, x: Int, surface: Int, z: Int): ColumnProfile? {
+        val p = profileOf(grid, x, surface, z) ?: return null
+        return if (p.top.material in TOPSOIL) ColumnProfile(DIRT, p.filler, p.fillerDepth, p.deep) else p
+    }
+
     /** Null when the column has no ground to copy at [surface] (e.g. water opening into a cave). */
     private fun profileOf(grid: SurfaceGrid, x: Int, surface: Int, z: Int): ColumnProfile? {
         val floor = grid.world.minHeight
@@ -294,3 +308,71 @@ object GenerateJob {
         return task
     }
 }
+
+/**
+ * Where the floor under water comes from: every column of the grid that is a
+ * real sea, river or lake bed (water over ground, not over a cave) is a
+ * source, and each column takes the stack of its nearest source. The lookup
+ * point is warped by slow noise so patches of sand, gravel, clay or dirt
+ * meet along organic edges instead of straight stripes from the selection edge.
+ */
+private class Seabed(
+    private val grid: SurfaceGrid, seed: Long,
+    private val stackOf: (x: Int, y: Int, z: Int) -> ColumnProfile?,
+) {
+    private val source = IntArray(grid.width * grid.depth) { -1 }
+    private val profiles = HashMap<Int, ColumnProfile?>()
+    private val warpX = OctaveNoise(seed xor WARP_SALT_X, 2)
+    private val warpZ = OctaveNoise(seed xor WARP_SALT_Z, 2)
+
+    init {
+        val queue = ArrayDeque<Int>()
+        for (z in 0 until grid.depth) {
+            for (x in 0 until grid.width) {
+                val i = z * grid.width + x
+                val wet = grid.surface[i] > grid.heights[i]
+                if (wet && SurfaceScanner.isTerrain(grid.type(grid.originX + x, grid.heights[i], grid.originZ + z))) {
+                    source[i] = i
+                    queue.add(i)
+                }
+            }
+        }
+        while (queue.isNotEmpty()) {
+            val i = queue.removeFirst()
+            val x = i % grid.width
+            val z = i / grid.width
+            for ((nx, nz) in listOf(x + 1 to z, x - 1 to z, x to z + 1, x to z - 1)) {
+                if (nx !in 0 until grid.width || nz !in 0 until grid.depth) continue
+                val j = nz * grid.width + nx
+                if (source[j] < 0) {
+                    source[j] = source[i]
+                    queue.add(j)
+                }
+            }
+        }
+    }
+
+    /** Floor stack for world column (x, z), or null when there is no bed anywhere in the grid. */
+    fun profileAt(x: Int, z: Int): ColumnProfile? {
+        val wx = (x - grid.originX + Math.round(WARP * warpX.sample(x / WARP_SCALE, z / WARP_SCALE)).toInt())
+            .coerceIn(0, grid.width - 1)
+        val wz = (z - grid.originZ + Math.round(WARP * warpZ.sample(x / WARP_SCALE, z / WARP_SCALE)).toInt())
+            .coerceIn(0, grid.depth - 1)
+        val s = source[wz * grid.width + wx]
+        if (s < 0) return null
+        return profiles.getOrPut(s) {
+            val sx = grid.originX + s % grid.width
+            val sz = grid.originZ + s / grid.width
+            stackOf(sx, grid.heights[s], sz)
+        }
+    }
+
+    private companion object {
+        // Patch edges wander up to this many blocks, over features about WARP_SCALE wide.
+        const val WARP = 6.0
+        const val WARP_SCALE = 14.0
+        const val WARP_SALT_X = 0x6A09E667F3BCC909L
+        const val WARP_SALT_Z = 0x3C6EF372FE94F82BL
+    }
+}
+
