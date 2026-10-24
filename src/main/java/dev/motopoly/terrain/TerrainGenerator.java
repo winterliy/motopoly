@@ -24,7 +24,10 @@ package dev.motopoly.terrain;
  *       that noise is used, modulated by a slower "erosion" noise. Either way
  *       the detail is pasted with Poisson seamless cloning, so it reaches the
  *       edge and still lines up with the surroundings.</li>
- *   <li>A light blur, thermal erosion to cap slopes, then rounding to whole blocks.</li>
+ *   <li>A light blur, thermal erosion to cap slopes, then rounding to whole blocks.
+ *       Inside the edge band the ground is pinned at the target level: the
+ *       slope limit shapes the ramp around it and never lowers the plateau.
+ *       If the band is too narrow for the climb, the ramp gets steeper.</li>
  * </ol>
  *
  * <p>Input is the selection plus a margin on every side. The margin is never
@@ -44,6 +47,8 @@ public final class TerrainGenerator {
     private static final double AUTO_RELIEF_MAX = 2.5;
     // 5x5 median: removes holes and spikes up to two blocks wide, keeps real slopes.
     private static final int DESPIKE_RADIUS = 2;
+    // A pinned plateau this far outside the ring's cones still rounds to a one-block ramp.
+    private static final double FIT_SLACK = 0.5;
 
     private TerrainGenerator() {
     }
@@ -78,6 +83,8 @@ public final class TerrainGenerator {
         if (margin < 1 || w <= 0 || d <= 0) {
             throw new IllegalArgumentException("need margin >= 1 and a selection of at least 1x1");
         }
+        // The innermost columns always get the full target level, even when the band is wider than the selection allows.
+        int edge = Math.min(params.edge(), (Math.min(w, d) - 1) / 2);
         // A ravine or cave mouth just outside would otherwise drag the new ground down into it.
         heights = despikeMargin(heights, fullW, fullD, margin, DESPIKE_RADIUS);
 
@@ -121,12 +128,13 @@ public final class TerrainGenerator {
                 int fi = (z + margin) * fullW + (x + margin);
                 if (params.baseY() != null) {
                     double level = levels == null ? params.baseY() : levels[z * w + x];
-                    double t = edgeWeight(x, z, w, d, params.edge());
+                    double t = edgeWeight(x, z, w, d, edge);
                     field[fi] += (level - field[fi]) * t;
                 }
             }
         }
 
+        double[] base = field.clone();
         // Poisson seamless cloning (Pérez et al. 2003): paste the detail at full
         // strength right up to the edge, then add the harmonic correction that
         // cancels it on the boundary ring. The seam vanishes while the texture
@@ -141,8 +149,19 @@ public final class TerrainGenerator {
             }
         }
 
+        double[] blurredBase = base;
         for (int pass = 0; pass < params.smoothPasses(); pass++) {
             field = blur(field, fullW, fullD, margin);
+            blurredBase = blur(blurredBase, fullW, fullD, margin);
+        }
+        if (params.baseY() != null) {
+            // Blurring would pull the plateau's rim toward the ramp: the level stays, only the bumps are softened.
+            for (int z = edge; z < d - edge; z++) {
+                for (int x = edge; x < w - edge; x++) {
+                    int fi = (z + margin) * fullW + (x + margin);
+                    field[fi] += base[fi] - blurredBase[fi];
+                }
+            }
         }
         if (params.topY() != null) {
             // Bumps may not poke out of the range; the edge band still eases into the surroundings.
@@ -150,12 +169,22 @@ public final class TerrainGenerator {
                 for (int x = 0; x < w; x++) {
                     int fi = (z + margin) * fullW + (x + margin);
                     double v = field[fi];
-                    field[fi] += (clamp(v, params.baseY(), params.topY()) - v) * edgeWeight(x, z, w, d, params.edge());
+                    field[fi] += (clamp(v, params.baseY(), params.topY()) - v) * edgeWeight(x, z, w, d, edge);
                 }
             }
         }
         if (params.maxStep() > 0) {
-            thermalErosion(field, fullW, fullD, margin, params.maxStep());
+            boolean[] pinned = null;
+            if (params.baseY() != null) {
+                pinned = new boolean[fullW * fullD];
+                for (int z = 0; z < d; z++) {
+                    for (int x = 0; x < w; x++) {
+                        int dist = Math.min(Math.min(x, z), Math.min(w - 1 - x, d - 1 - z));
+                        pinned[(z + margin) * fullW + (x + margin)] = dist >= edge;
+                    }
+                }
+            }
+            thermalErosion(field, fullW, fullD, margin, params.maxStep(), pinned);
         }
 
         int[] target = new int[w * d];
@@ -375,36 +404,70 @@ public final class TerrainGenerator {
      * </ol>
      * Each step is two raster sweeps (exact for 4-neighbour distance). A little
      * slack keeps rounded heights within one block of each other.
+     *
+     * <p>{@code pinned} cells (may be {@code null}) keep their height and act
+     * as fixed sources like the ring. When the gap between them and the ring
+     * is too short for the talus, the talus is relaxed until the climb fits.
      */
-    static void thermalErosion(double[] h, int fullW, int fullD, int margin, double maxStep) {
+    static void thermalErosion(double[] h, int fullW, int fullD, int margin, double maxStep, boolean[] pinned) {
         double talus = Math.max(0.05, maxStep - 0.05);
         int w = fullW - 2 * margin;
         int d = fullD - 2 * margin;
         double[] upper = new double[h.length];
         double[] lower = new double[h.length];
-        for (int z = margin - 1; z <= margin + d; z++) {
-            for (int x = margin - 1; x <= margin + w; x++) {
-                int i = z * fullW + x;
-                boolean inner = x >= margin && x < margin + w && z >= margin && z < margin + d;
-                upper[i] = inner ? Double.POSITIVE_INFINITY : h[i];
-                lower[i] = inner ? Double.NEGATIVE_INFINITY : h[i];
+        if (pinned != null) {
+            // Judged at the full step: the slack below the talus is only there for rounding.
+            for (int tries = 0; tries < 60 && !pinnedFit(h, upper, lower, fullW, margin, w, d, talus + 0.05, pinned); tries++) {
+                talus *= 1.1;
             }
         }
-        sweep(upper, fullW, margin, w, d, talus, true);
-        sweep(lower, fullW, margin, w, d, -talus, false);
+        bounds(h, upper, lower, fullW, margin, w, d, pinned);
+        sweep(upper, fullW, margin, w, d, talus, true, pinned);
+        sweep(lower, fullW, margin, w, d, -talus, false, pinned);
 
         for (int round = 0; round < 3; round++) {
             for (int z = margin; z < margin + d; z++) {
                 for (int x = margin; x < margin + w; x++) {
                     int i = z * fullW + x;
+                    if (pinned != null && pinned[i]) continue;
                     double lo = lower[i];
                     double hi = upper[i];
                     // A boundary steeper than the talus leaves no valid range: split the difference.
                     h[i] = lo > hi ? (lo + hi) / 2 : clamp(h[i], lo, hi);
                 }
             }
-            sweep(h, fullW, margin, w, d, talus, true);
+            // Shaving bumps inside the plateau is fine; its level is already bounded by the ramp.
+            sweep(h, fullW, margin, w, d, talus, true, null);
         }
+    }
+
+    /** Seeds the cone bounds: fixed heights on the ring (and pinned cells), open everywhere else. */
+    private static void bounds(double[] h, double[] upper, double[] lower, int fullW, int margin, int w, int d,
+                               boolean[] pinned) {
+        for (int z = margin - 1; z <= margin + d; z++) {
+            for (int x = margin - 1; x <= margin + w; x++) {
+                int i = z * fullW + x;
+                boolean inner = x >= margin && x < margin + w && z >= margin && z < margin + d;
+                boolean open = inner && (pinned == null || !pinned[i]);
+                upper[i] = open ? Double.POSITIVE_INFINITY : h[i];
+                lower[i] = open ? Double.NEGATIVE_INFINITY : h[i];
+            }
+        }
+    }
+
+    /** Whether every pinned cell lies within the ring's cones at this talus. */
+    private static boolean pinnedFit(double[] h, double[] upper, double[] lower, int fullW, int margin, int w, int d,
+                                     double talus, boolean[] pinned) {
+        bounds(h, upper, lower, fullW, margin, w, d, null);
+        sweep(upper, fullW, margin, w, d, talus, true, null);
+        sweep(lower, fullW, margin, w, d, -talus, false, null);
+        for (int z = margin; z < margin + d; z++) {
+            for (int x = margin; x < margin + w; x++) {
+                int i = z * fullW + x;
+                if (pinned[i] && (h[i] > upper[i] + FIT_SLACK || h[i] < lower[i] - FIT_SLACK)) return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -415,12 +478,13 @@ public final class TerrainGenerator {
      * a path like "in from the right, then down" needs another round; repeat
      * forward/backward pairs until nothing changes.
      */
-    static void sweep(double[] v, int fullW, int margin, int w, int d, double step, boolean takeMin) {
+    static void sweep(double[] v, int fullW, int margin, int w, int d, double step, boolean takeMin, boolean[] fixed) {
         for (int round = 0; round < w + d; round++) {
             boolean changed = false;
             for (int z = margin; z < margin + d; z++) {
                 for (int x = margin; x < margin + w; x++) {
                     int i = z * fullW + x;
+                    if (fixed != null && fixed[i]) continue;
                     double next = pick(v[i], v[i - 1] + step, v[i - fullW] + step, takeMin);
                     if (next != v[i]) {
                         v[i] = next;
@@ -431,6 +495,7 @@ public final class TerrainGenerator {
             for (int z = margin + d - 1; z >= margin; z--) {
                 for (int x = margin + w - 1; x >= margin; x--) {
                     int i = z * fullW + x;
+                    if (fixed != null && fixed[i]) continue;
                     double next = pick(v[i], v[i + 1] + step, v[i + fullW] + step, takeMin);
                     if (next != v[i]) {
                         v[i] = next;

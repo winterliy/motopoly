@@ -184,10 +184,10 @@ class TerrainGeneratorTest {
 
     @Test
     void thermalErosionCapsSlopes() {
-        // A 30-block drop squeezed into a 3-block edge band would be a cliff.
+        // A 30-block drop with a 30-block edge band fits one block per column.
         int w = 80, d = 80, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
         int[] h = grid(fullW, fullD, (x, z) -> 90);
-        GenerateParams p = new GenerateParams(60, 0, 48, 3, 0, 1.0, 1L, -64, 319);
+        GenerateParams p = new GenerateParams(60, 0, 48, 30, 0, 1.0, 1L, -64, 319);
         int[] target = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p).target();
         for (int z = 0; z < d; z++) {
             assertTrue(Math.abs(target[z * w] - 90) <= 1, "edge must meet the 90-high surroundings");
@@ -196,7 +196,24 @@ class TerrainGeneratorTest {
                 assertTrue(step <= 1, "step " + step + " at (" + x + "," + z + ")");
             }
         }
-        assertEquals(60, target[(d / 2) * w + w / 2], "centre still reaches the target");
+        for (int z = 30; z < d - 30; z++) {
+            for (int x = 30; x < w - 30; x++) assertEquals(60, target[z * w + x], "plateau at (" + x + "," + z + ")");
+        }
+    }
+
+    @Test
+    void plateauRisesToTargetEvenWhenBandIsShort() {
+        // 25 blocks up with only a 6-block band: the ramp gets steeper, the plateau never sinks.
+        int w = 40, d = 40, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] h = grid(fullW, fullD, (x, z) -> 64);
+        GenerateParams p = new GenerateParams(89, 0, 48, edge, 2, 1.0, 1L, -64, 319);
+        int[] target = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p).target();
+        for (int z = edge; z < d - edge; z++) {
+            for (int x = edge; x < w - edge; x++) assertEquals(89, target[z * w + x], "(" + x + "," + z + ")");
+        }
+        int row = (d / 2) * w;
+        assertTrue(target[row] < 89 - 10, "outer column must stay near the surroundings: " + target[row]);
+        for (int x = 1; x <= edge; x++) assertTrue(target[row + x] >= target[row + x - 1], "ramp climbs");
     }
 
     @Test
@@ -212,12 +229,13 @@ class TerrainGeneratorTest {
     void randomTerrainNeverStepsMoreThanOne() {
         java.util.Random r = new java.util.Random(5);
         for (int trial = 0; trial < 100; trial++) {
-            int w = 20 + r.nextInt(50), d = 20 + r.nextInt(50), fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
-            double a = r.nextDouble() * 20;
+            int w = 90 + r.nextInt(50), d = 90 + r.nextInt(50), fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+            double a = r.nextDouble() * 12;
             int phase = trial;
             int[] h = grid(fullW, fullD, (x, z) -> 64 + (int) (a * Math.sin(x / 5.0 + phase) + a * Math.cos(z / 7.0)) + r.nextInt(4));
             int[] reference = grid(fullW, fullD, (x, z) -> 64 + r.nextInt(3));
-            GenerateParams p = new GenerateParams(60 + r.nextInt(20), Double.NaN, 48, r.nextInt(12), 2, 1.0, trial, -64, 319);
+            // Band wide enough for the climb, so the slope limit can always hold.
+            GenerateParams p = new GenerateParams(60 + r.nextInt(20), Double.NaN, 48, 40, 2, 1.0, trial, -64, 319);
             int[] t = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, p, r.nextBoolean() ? reference : null).target();
             for (int z = 0; z < d; z++) {
                 for (int x = 0; x < w; x++) {
