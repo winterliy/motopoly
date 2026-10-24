@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.motopoly"
-version = "1.6.1"
+version = "1.7.0"
 
 val kotlinVersion = "2.4.20"
 

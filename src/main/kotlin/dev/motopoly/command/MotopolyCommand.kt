@@ -72,7 +72,8 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
             """
             <gold>사용 순서</gold>
             <yellow>1.</yellow> <yellow>/$label pos1</yellow>, <yellow>/$label pos2</yellow> <gray>구역 지정 (또는 /$label wand 로 클릭)
-            <yellow>2.</yellow> <yellow>/$label gen <y></yellow> <gray>구역 땅을 Y 높이로 올리거나 내리고, 주변과 자연스럽게 이어요
+            <yellow>2.</yellow> <yellow>/$label gen [y]</yellow> <gray>구역 땅을 Y 높이로 올리거나 내리고, 주변과 자연스럽게 이어요
+               <gray>y를 빼면 두 지점의 Y를 써요: 같으면 그 높이의 평지, 다르면 그 범위 안에서 높낮이
             <yellow>3.</yellow> <yellow>/$label config <smooth|rough|step> [값]</yellow> <gray>설정 변경, 값을 빼면 기본값으로
             <yellow>4.</yellow> <yellow>/$label undo</yellow> <gray>마지막 작업 되돌리기
             <gray>기타: /$label info (지형 분석), /$label config (현재 설정 보기), /$label reload
@@ -92,6 +93,11 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private fun roughText(rough: Double) = if (rough.isNaN()) "auto" else "%.1f".format(rough)
 
     private fun stepText(step: Int) = if (step == 0) "끔" else "${step}블록"
+
+    private fun targetText(params: GenerateParams): String {
+        val top = params.topY() ?: return "${params.baseY()}"
+        return if (top == params.baseY()) "$top(평지)" else "${params.baseY()}~$top"
+    }
 
     private fun config(player: Player, label: String, key: String?, value: String?) {
         val pdc = player.persistentDataContainer
@@ -179,17 +185,27 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
         val world = player.world
         val minY = world.minHeight + 1
         val maxY = world.maxHeight - 2
-        if (yArg == null) {
-            player.msg("<red>높이를 입력해 주세요: <yellow>/$label gen <y></yellow> <gray>(지금 서 있는 높이: ${player.location.blockY - 1})")
-            return
-        }
-        val y = yArg.toIntOrNull()?.takeIf { it in minY..maxY } ?: run {
-            player.msg("<red>y는 $minY~$maxY 사이 정수예요.")
-            return
+        // Without a height, the two corners' Y set the range: equal means flat, apart means rolling between them.
+        val (low, top) = if (yArg == null) {
+            val range = plugin.selections.of(player.uniqueId).heights(world) ?: run {
+                player.msg("<red>이 월드에서 두 지점을 먼저 찍어 주세요. <gray>(/mt pos1, /mt pos2)")
+                return
+            }
+            if (range.first < minY || range.last > maxY) {
+                player.msg("<red>두 지점의 Y는 $minY~$maxY 사이여야 해요. <gray>(지금 ${range.first}~${range.last})")
+                return
+            }
+            range.first to range.last
+        } else {
+            val y = yArg.toIntOrNull()?.takeIf { it in minY..maxY } ?: run {
+                player.msg("<red>y는 $minY~$maxY 사이 정수예요. <gray>(/$label gen 만 치면 두 지점의 Y 범위를 써요)")
+                return
+            }
+            y to null
         }
         val region = region(player) ?: return
         val params = GenerateParams(
-            y, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, stepOf(player).toDouble(),
+            low, top, roughOf(player), plugin.settings.scale, smoothOf(player), BLUR_PASSES, stepOf(player).toDouble(),
             world.seed, minY, maxY,
         )
         generate(player, region, params)
@@ -257,7 +273,7 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
                 val smoothNote = if (used.edge() != params.edge()) "${used.edge()}(섬이라 자동 확장)" else "${used.edge()}"
                 player.msg(
                     (if (water.island) "<aqua>섬 모드</aqua> <gray>(수면 Y ${water.level})</gray> " else "") +
-                        "<white>목표 Y <aqua>${params.baseY()}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
+                        "<white>목표 Y <aqua>${targetText(params)}</aqua>, 지표면 <aqua>${target.min()}~${target.max()}</aqua>, " +
                         "smooth <aqua>$smoothNote</aqua>, step <aqua>${stepText(used.maxStep().toInt())}</aqua>, 기복 <aqua>${"%.1f".format(plan.roughness())}</aqua>" +
                         (if (plan.vanillaRelief()) "(바닐라 지형) " else "(노이즈) ") +
                         "<gray>(블록 변경 ${changes.size}개)"

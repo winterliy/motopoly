@@ -9,7 +9,7 @@ libraries:
 commands:
   motopoly:
     description: Motopoly 땅 생성 명령어
-    usage: /<command> <pos1|pos2|gen <y>|config <smooth|rough> [값]|undo|help>
+    usage: /<command> <pos1|pos2|gen [y]|config <smooth|rough> [값]|undo|help>
     aliases: [mt]
     permission: motopoly.use
 

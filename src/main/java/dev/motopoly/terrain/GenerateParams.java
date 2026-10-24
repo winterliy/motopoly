@@ -5,6 +5,9 @@ package dev.motopoly.terrain;
  *
  * @param baseY        ground level to aim for inside the selection, or {@code null}
  *                     to follow the surrounding terrain only
+ * @param topY         with a base Y, the top of a height range: the ground then
+ *                     rolls between {@code baseY} and {@code topY} (equal means
+ *                     dead flat); {@code null} keeps the usual bumps around {@code baseY}
  * @param roughness    typical undulation in blocks, or {@code NaN} to derive it from the surroundings
  * @param scale        horizontal size of the undulations in blocks
  * @param edge         width of the transition band along the selection edge, in blocks
@@ -17,6 +20,7 @@ package dev.motopoly.terrain;
  */
 public record GenerateParams(
         Integer baseY,
+        Integer topY,
         double roughness,
         double scale,
         int edge,
@@ -33,9 +37,15 @@ public record GenerateParams(
         if (maxStep < 0) throw new IllegalArgumentException("maxStep must be >= 0");
         if (!Double.isNaN(roughness) && roughness < 0) throw new IllegalArgumentException("roughness must be >= 0");
         if (minY > maxY) throw new IllegalArgumentException("minY must be <= maxY");
+        if (topY != null && (baseY == null || topY < baseY)) throw new IllegalArgumentException("topY needs baseY <= topY");
+    }
+
+    public GenerateParams(Integer baseY, double roughness, double scale, int edge, int smoothPasses,
+                          double maxStep, long seed, int minY, int maxY) {
+        this(baseY, null, roughness, scale, edge, smoothPasses, maxStep, seed, minY, maxY);
     }
 
     public GenerateParams withEdge(int newEdge) {
-        return new GenerateParams(baseY, roughness, scale, newEdge, smoothPasses, maxStep, seed, minY, maxY);
+        return new GenerateParams(baseY, topY, roughness, scale, newEdge, smoothPasses, maxStep, seed, minY, maxY);
     }
 }

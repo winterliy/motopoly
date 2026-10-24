@@ -228,6 +228,40 @@ class TerrainGeneratorTest {
         }
     }
 
+    private static GenerateParams range(int lo, int hi, double rough, int edge) {
+        return new GenerateParams(lo, hi, rough, 48, edge, 2, 1.0, 1234L, -64, 319);
+    }
+
+    @Test
+    void equalRangeEndsGiveFlatGround() {
+        // Hilly surroundings and full-strength bumps, yet the inside sits dead flat at 64.
+        int w = 40, d = 40, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] h = grid(fullW, fullD, (x, z) -> 64 + (int) (4 * Math.sin(x / 6.0) + 3 * Math.cos(z / 5.0)));
+        int[] t = TerrainGenerator.plan(h, fullW, fullD, MARGIN, 0, 0, range(64, 64, 2.0, edge), h).target();
+        for (int z = edge; z < d - edge; z++) {
+            for (int x = edge; x < w - edge; x++) assertEquals(64, t[z * w + x], "(" + x + "," + z + ")");
+        }
+    }
+
+    @Test
+    void rangeKeepsGroundBetweenItsEnds() {
+        int w = 60, d = 50, edge = 6, fullW = w + 2 * MARGIN, fullD = d + 2 * MARGIN;
+        int[] flat = grid(fullW, fullD, (x, z) -> 62);
+        int[] hills = grid(fullW, fullD, (x, z) -> 60 + x / 3 + (int) (2 * Math.sin(z / 4.0)));
+        for (int[] reference : new int[][] {null, flat, hills}) {
+            int[] t = TerrainGenerator.plan(flat, fullW, fullD, MARGIN, 0, 0, range(61, 64, 1.5, edge), reference).target();
+            java.util.Set<Integer> seen = new java.util.HashSet<>();
+            for (int z = edge; z < d - edge; z++) {
+                for (int x = edge; x < w - edge; x++) {
+                    int y = t[z * w + x];
+                    assertTrue(y >= 61 && y <= 64, "y " + y + " at (" + x + "," + z + ")");
+                    seen.add(y);
+                }
+            }
+            assertTrue(seen.size() >= 3, "range barely used: " + seen);
+        }
+    }
+
     @Test
     void islandEdgeWidensForDeepWater() {
         // Sea floor at 40, island top at 70: 30 blocks to climb at <= 1 per block.

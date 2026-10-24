@@ -43,6 +43,14 @@ class Selection {
         if (worldId != world.uid) return null
         return Region(world, minOf(a.x, b.x), minOf(a.z, b.z), maxOf(a.x, b.x), maxOf(a.z, b.z))
     }
+
+    /** Y span between the two corners, for /mt gen without a height. */
+    fun heights(world: World): IntRange? {
+        val a = pos1 ?: return null
+        val b = pos2 ?: return null
+        if (worldId != world.uid) return null
+        return minOf(a.y, b.y)..maxOf(a.y, b.y)
+    }
 }
 
 class SelectionManager {

@@ -37,7 +37,8 @@ data class Generation(
             // Mostly water around: rise from the shelf like an island, with a ramp long enough for the climb.
             val used = if (water.island && params.baseY() != null) {
                 val floor = TerrainStats.ofBand(boundary, grid.width, grid.depth, grid.margin).median().toDouble()
-                params.withEdge(TerrainGenerator.islandEdge(params.baseY(), floor, params.edge(), w, d, params.maxStep()))
+                val top = params.topY() ?: params.baseY()
+                params.withEdge(TerrainGenerator.islandEdge(top, floor, params.edge(), w, d, params.maxStep()))
             } else {
                 params
             }

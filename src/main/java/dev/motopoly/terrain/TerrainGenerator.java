@@ -12,7 +12,10 @@ package dev.motopoly.terrain;
  *       equation, via SOR). That is the smoothest surface that touches every
  *       edge, so slopes on one side fade naturally into the other.</li>
  *   <li><b>Target level.</b> If a base Y is given, the surface eases from the
- *       membrane at the edge to that level over the {@code edge} band.</li>
+ *       membrane at the edge to that level over the {@code edge} band. With a
+ *       height range instead, the level itself rolls between its two ends,
+ *       following the large shapes of the vanilla terrain there (or slow
+ *       noise), and the ground inside never leaves the range.</li>
  *   <li><b>Natural detail.</b> Preferably the real thing: the heightmap the
  *       vanilla generator produces for these very coordinates, high-pass
  *       filtered so only the small bumps remain (no mountains or valleys).
@@ -32,6 +35,9 @@ public final class TerrainGenerator {
     // output so `roughness` is close to the real peak deviation in blocks.
     private static final double NOISE_GAIN = 1.6;
     private static final long EROSION_SALT = 0x5DEECE66DL;
+    private static final long RANGE_SALT = 0x2545F4914F6CDD1DL;
+    // Large vanilla shapes flatter than this inside the selection can't shape a height range.
+    private static final double MIN_SHAPE_SPAN = 1.0;
     private static final double CONVERGED = 0.005;
     // Vanilla relief keeps its natural size under rough=auto, within these bounds.
     private static final double AUTO_RELIEF_MIN = 0.4;
@@ -108,12 +114,15 @@ public final class TerrainGenerator {
         double[] boundary = new double[fullW * fullD];
         for (int i = 0; i < boundary.length; i++) boundary[i] = heights[i];
         double[] field = membrane(boundary, fullW, fullD, margin, w, d);
+        double[] levels = params.topY() == null ? null : rangeLevels(params.baseY(), params.topY(),
+                reference, fullW, fullD, margin, originX, originZ, params.scale(), params.seed());
         for (int z = 0; z < d; z++) {
             for (int x = 0; x < w; x++) {
                 int fi = (z + margin) * fullW + (x + margin);
                 if (params.baseY() != null) {
+                    double level = levels == null ? params.baseY() : levels[z * w + x];
                     double t = edgeWeight(x, z, w, d, params.edge());
-                    field[fi] += (params.baseY() - field[fi]) * t;
+                    field[fi] += (level - field[fi]) * t;
                 }
             }
         }
@@ -134,6 +143,16 @@ public final class TerrainGenerator {
 
         for (int pass = 0; pass < params.smoothPasses(); pass++) {
             field = blur(field, fullW, fullD, margin);
+        }
+        if (params.topY() != null) {
+            // Bumps may not poke out of the range; the edge band still eases into the surroundings.
+            for (int z = 0; z < d; z++) {
+                for (int x = 0; x < w; x++) {
+                    int fi = (z + margin) * fullW + (x + margin);
+                    double v = field[fi];
+                    field[fi] += (clamp(v, params.baseY(), params.topY()) - v) * edgeWeight(x, z, w, d, params.edge());
+                }
+            }
         }
         if (params.maxStep() > 0) {
             thermalErosion(field, fullW, fullD, margin, params.maxStep());
@@ -192,6 +211,14 @@ public final class TerrainGenerator {
      * left are the small natural bumps; mountains, valleys and slopes cancel out.
      */
     static double[] relief(int[] heights, int width, int depth, int radius) {
+        double[] smooth = lowPass(heights, width, depth, radius);
+        double[] out = new double[heights.length];
+        for (int i = 0; i < out.length; i++) out[i] = heights[i] - smooth[i];
+        return out;
+    }
+
+    /** Blurred heightmap: the hills and valleys without the small bumps. */
+    static double[] lowPass(int[] heights, int width, int depth, int radius) {
         double[] smooth = new double[heights.length];
         for (int i = 0; i < heights.length; i++) smooth[i] = heights[i];
         // Three box blurs approximate a Gaussian.
@@ -199,9 +226,56 @@ public final class TerrainGenerator {
             smooth = boxBlur(smooth, width, depth, radius, true);
             smooth = boxBlur(smooth, width, depth, radius, false);
         }
-        double[] out = new double[heights.length];
-        for (int i = 0; i < out.length; i++) out[i] = heights[i] - smooth[i];
-        return out;
+        return smooth;
+    }
+
+    /**
+     * Ground level per selection column for a height range, row-major over the
+     * selection: the large vanilla shapes at these coordinates (or slow noise
+     * when there are none) stretched so the lowest spot sits at {@code lo} and
+     * the highest at {@code hi}.
+     */
+    static double[] rangeLevels(int lo, int hi, int[] reference, int fullW, int fullD, int margin,
+                                int originX, int originZ, double scale, long seed) {
+        int w = fullW - 2 * margin;
+        int d = fullD - 2 * margin;
+        double[] shape = new double[w * d];
+        if (hi == lo) {
+            java.util.Arrays.fill(shape, lo);
+            return shape;
+        }
+        double[] hills = reference == null ? null : lowPass(reference, fullW, fullD, reliefRadius(scale));
+        if (hills != null) {
+            for (int z = 0; z < d; z++) {
+                for (int x = 0; x < w; x++) shape[z * w + x] = hills[(z + margin) * fullW + (x + margin)];
+            }
+        }
+        if (hills == null || span(shape) < MIN_SHAPE_SPAN) {
+            OctaveNoise noise = new OctaveNoise(seed ^ RANGE_SALT, 3);
+            for (int z = 0; z < d; z++) {
+                for (int x = 0; x < w; x++) {
+                    shape[z * w + x] = noise.sample((originX + margin + x) / scale, (originZ + margin + z) / scale);
+                }
+            }
+        }
+        double min = Double.POSITIVE_INFINITY;
+        for (double v : shape) min = Math.min(min, v);
+        double spread = span(shape);
+        for (int i = 0; i < shape.length; i++) {
+            double f = spread > 1e-9 ? (shape[i] - min) / spread : 0.5;
+            shape[i] = lo + (hi - lo) * f;
+        }
+        return shape;
+    }
+
+    private static double span(double[] values) {
+        double min = Double.POSITIVE_INFINITY;
+        double max = Double.NEGATIVE_INFINITY;
+        for (double v : values) {
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        return max - min;
     }
 
     private static double[] boxBlur(double[] src, int width, int depth, int radius, boolean horizontal) {
