@@ -12,10 +12,12 @@ import java.util.stream.IntStream
  * world's own generator and seed: no chunks are built and nothing is loaded.
  *
  * @param heights Y of the top solid block vanilla would place (the sea floor under oceans)
- * @param dry     true where that top block is above sea level
  * @param biomes  biome key at the surface, e.g. `minecraft:desert`
  */
-class VanillaColumns(val heights: IntArray, val dry: BooleanArray, val biomes: Array<String>)
+class VanillaColumns(val heights: IntArray, val biomes: Array<String>, private val seaLevel: Int) {
+    /** Whether vanilla's top block at column [i] is above sea level. */
+    fun dry(i: Int) = heights[i] >= seaLevel
+}
 
 object VanillaTerrain {
     /**
@@ -28,9 +30,7 @@ object VanillaTerrain {
         val source = level.chunkSource
         val generator = source.generator
         val random = source.randomState()
-        val sea = generator.seaLevel
         val heights = IntArray(width * depth)
-        val dry = BooleanArray(width * depth)
         val biomes = arrayOfNulls<String>(width * depth)
         IntStream.range(0, depth).parallel().forEach { z ->
             // A resolver keeps per-thread state, so each row gets its own.
@@ -42,13 +42,12 @@ object VanillaTerrain {
                 val top = generator.getBaseHeight(wx, wz, Heightmap.Types.OCEAN_FLOOR_WG, level, random) - 1
                 val i = z * width + x
                 heights[i] = top
-                dry[i] = top >= sea
                 biomes[i] = resolver.getNoiseBiome(QuartPos.fromBlock(wx), QuartPos.fromBlock(top), QuartPos.fromBlock(wz))
                     .registeredName
             }
         }
         @Suppress("UNCHECKED_CAST")
-        VanillaColumns(heights, dry, biomes as Array<String>)
+        VanillaColumns(heights, biomes as Array<String>, generator.seaLevel)
     } catch (e: Throwable) {
         logger.warn("Could not sample vanilla terrain in {}; falling back to noise", world.name, e)
         null

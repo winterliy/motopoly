@@ -116,7 +116,7 @@ object GenerateJob {
                     ?: profileOf(grid, outsideX, grid.heights[outsideIndex], outsideZ)?.also { profiles[outsideIndex] = it }
 
                 // Vanilla's biome here, where vanilla itself has dry land.
-                val biome = vanilla?.takeIf { it.dry[gi] }?.biomes?.get(gi)
+                val biome = vanilla?.takeIf { it.dry(gi) }?.biomes?.get(gi)
                 val underwater = waterLevel != null && surface < waterLevel
                 val bed = if (seabed != null && (underwater || surface <= waterLevel!! + 2)) seabed.profileAt(x, z) else null
                 val sand = bed?.top?.material?.takeIf { it == Material.SAND || it == Material.RED_SAND }
@@ -208,7 +208,7 @@ object GenerateJob {
     private fun biomeProfile(biome: String): ColumnProfile = BIOME_PROFILES[biome]
         ?: if (biome in SNOWY) ColumnProfile(SNOWY_GRASS, DIRT, 3, STONE) else MEADOW
 
-    private val BIOME_PROFILES: Map<String, ColumnProfile> by lazy {
+    private val BIOME_PROFILES: Map<String, ColumnProfile> = run {
         fun stack(top: Material, filler: Material, depth: Int, deep: Material) =
             ColumnProfile(top.createBlockData(), filler.createBlockData(), depth, deep.createBlockData())
         val badlands = stack(Material.RED_SAND, Material.ORANGE_TERRACOTTA, 3, Material.TERRACOTTA)
