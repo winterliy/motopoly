@@ -11,22 +11,6 @@ data class Generation(
 ) {
     companion object {
         /**
-         * Below water the design treats the surroundings as no deeper than
-         * this under the surface: the band ends in a shallow shelf and the
-         * real floor drops away beyond it, instead of the ramp running down
-         * into a deep lake or ocean trench.
-         */
-        private const val SHELF_DEPTH = 4
-
-        private fun boundary(grid: SurfaceGrid): IntArray {
-            val boundary = grid.heights.copyOf()
-            for (i in boundary.indices) {
-                if (grid.surface[i] > grid.heights[i]) boundary[i] = maxOf(boundary[i], grid.surface[i] - SHELF_DEPTH)
-            }
-            return boundary
-        }
-
-        /**
          * Off the main thread: reads only snapshots. [params]' edge is the band
          * width; [grid]'s margin must be wider than that.
          */
@@ -35,8 +19,10 @@ data class Generation(
             maxFillDepth: Int, copyPlants: Boolean, beachWidth: Int, fillOres: Boolean,
         ): Generation {
             val waterLevel = WaterInfo.levelOf(grid)
+            // Under water the band meets the real floor, just like on land: the zone is pinned,
+            // so a deep sea nearby only lengthens the slope down to it instead of dragging the zone along.
             val plan = TerrainGenerator.plan(
-                boundary(grid), grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, reference?.heights
+                grid.heights, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, reference?.heights
             )
             val changes = GenerateJob.computeChanges(
                 grid, plan, maxFillDepth, reference, copyPlants, waterLevel, beachWidth, params.seed(), fillOres,
