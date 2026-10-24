@@ -3,10 +3,11 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 plugins {
     java
     kotlin("jvm") version "2.4.20"
+    id("io.papermc.paperweight.userdev") version "2.0.0-beta.24"
 }
 
 group = "dev.motopoly"
-version = "2.3.0"
+version = "3.0.0"
 
 val kotlinVersion = "2.4.20"
 
@@ -16,7 +17,8 @@ repositories {
 }
 
 dependencies {
-    compileOnly("io.papermc.paper:paper-api:26.3.build.218-stable")
+    // Server internals too: vanilla terrain is sampled straight from the world's own generator.
+    paperweight.paperDevBundle("26.3.build.218-stable")
 
     testImplementation(platform("org.junit:junit-bom:5.13.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")

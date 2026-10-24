@@ -15,8 +15,8 @@ data class Settings(
     /** Undulation in blocks, NaN = auto; players override it with /mt config rough. */
     val defaultRough: Double,
     val scale: Double,
-    /** Borrow topography, materials and plants from a same-seed twin world. */
-    val referenceTerrain: Boolean,
+    /** Shape and dress new ground after what vanilla generates there, computed on the spot. */
+    val vanillaTerrain: Boolean,
     val copyPlants: Boolean,
     /** Default steepest height difference between neighbouring columns (0 = off); players override it with /mt config step. */
     val maxStep: Double,
@@ -36,7 +36,7 @@ data class Settings(
             defaultRound = config.getInt("defaults.round", 0).coerceIn(0, 100),
             defaultRough = parseRough(config.getString("defaults.rough", "auto")!!) ?: Double.NaN,
             scale = config.getDouble("scale", 48.0).coerceAtLeast(1.0),
-            referenceTerrain = config.getBoolean("reference-terrain", true),
+            vanillaTerrain = config.getBoolean("vanilla-terrain", config.getBoolean("reference-terrain", true)),
             copyPlants = config.getBoolean("copy-plants", true),
             maxStep = config.getInt("max-step", 1).coerceIn(0, 16).toDouble(),
             beachWidth = config.getInt("beach-width", 5).coerceIn(0, 32),

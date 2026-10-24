@@ -6,6 +6,7 @@ import dev.motopoly.terrain.OreTable
 import org.bukkit.Bukkit
 import org.bukkit.Material
 import org.bukkit.block.data.BlockData
+import org.bukkit.block.data.Snowable
 import org.bukkit.plugin.Plugin
 import org.bukkit.scheduler.BukkitTask
 
@@ -49,12 +50,18 @@ object GenerateJob {
         OreTable.Ore.REDSTONE to Material.DEEPSLATE_REDSTONE_ORE, OreTable.Ore.LAPIS to Material.DEEPSLATE_LAPIS_ORE,
         OreTable.Ore.DIAMOND to Material.DEEPSLATE_DIAMOND_ORE,
     ).mapValues { it.value.createBlockData() }
+    private val SNOW = Material.SNOW.createBlockData()
+    private val SNOWY_GRASS = (Material.GRASS_BLOCK.createBlockData() as Snowable).apply { isSnowy = true }
+    // Biomes whose ground vanilla covers with a snow layer.
+    private val SNOWY = setOf(
+        "minecraft:snowy_plains", "minecraft:snowy_taiga", "minecraft:grove", "minecraft:snowy_beach",
+    )
     private val SHORT_GRASS = Material.SHORT_GRASS.createBlockData()
     private val FLOWERS = listOf(Material.DANDELION.createBlockData(), Material.POPPY.createBlockData())
 
     /**
      * Works out every block edit for [plan]. Reads only from the snapshots in
-     * [grid] and [reference], so it is safe to call off the main thread.
+     * [grid] and the numbers in [vanilla], so it is safe to call off the main thread.
      *
      * Each changed column: everything above the new surface is removed (or,
      * below [waterLevel], flooded), the surface gets a material stack, and any
@@ -66,13 +73,15 @@ object GenerateJob {
      * - at the waterline within [beachWidth] blocks of water, where that bed is
      *   sand: sand over sandstone (red sand over red sandstone);
      * - band columns on dry land: their own original stack and plants;
-     * - selection columns inland: the vanilla [reference] column when it is dry
-     *   land, else the nearest dry column outside, else grass over dirt.
-     * Plants come from the reference column, or are scattered over bare grass.
+     * - selection columns inland: the stack vanilla's biome there would have
+     *   (sand in deserts, podzol in old taiga…), else the nearest dry column
+     *   outside, else grass over dirt.
+     * Band columns keep their own plants; new grass gets sparse grass and
+     * flowers, snowy biomes a layer of snow.
      */
     fun computeChanges(
         grid: SurfaceGrid, plan: GeneratePlan, maxFillDepth: Int,
-        reference: SurfaceGrid?, copyPlants: Boolean,
+        vanilla: VanillaColumns?, copyPlants: Boolean,
         waterLevel: Int?, beachWidth: Int, seed: Long, fillOres: Boolean,
     ): ChangeSet {
         val changes = ChangeSet(grid.world.uid)
@@ -106,9 +115,8 @@ object GenerateJob {
                 fun outsideProfile() = profiles[outsideIndex]
                     ?: profileOf(grid, outsideX, grid.heights[outsideIndex], outsideZ)?.also { profiles[outsideIndex] = it }
 
-                // Same coordinates in the twin world; dry land there means its column is usable.
-                val refTop = reference?.heights?.get(gi)
-                val vanilla = refTop != null && reference.surface[gi] == refTop
+                // Vanilla's biome here, where vanilla itself has dry land.
+                val biome = vanilla?.takeIf { it.dry[gi] }?.biomes?.get(gi)
                 val underwater = waterLevel != null && surface < waterLevel
                 val bed = if (seabed != null && (underwater || surface <= waterLevel!! + 2)) seabed.profileAt(x, z) else null
                 val sand = bed?.top?.material?.takeIf { it == Material.SAND || it == Material.RED_SAND }
@@ -122,14 +130,14 @@ object GenerateJob {
                     underwater -> bed ?: SEA_FLOOR
                     beach -> if (sand == Material.RED_SAND) RED_BEACH else BEACH
                     own != null -> own
-                    vanilla -> profileOf(reference, x, refTop, z) ?: MEADOW
+                    biome != null -> biomeProfile(biome)
                     outsideDry -> outsideProfile() ?: MEADOW
                     else -> MEADOW
                 }
                 val plants = when {
                     !copyPlants || underwater || beach -> emptyList()
                     own != null -> plantsAbove(grid, x, grid.heights[gi], z)
-                    vanilla -> plantsAbove(reference, x, refTop, z)
+                    biome != null && biome in SNOWY -> listOf(SNOW)
                     profile.top.material == Material.GRASS_BLOCK -> scatteredPlant(x, z, seed)
                     else -> emptyList()
                 }
@@ -194,6 +202,37 @@ object GenerateJob {
             }
         }
         return dist
+    }
+
+    /** Roughly what vanilla's surface rules lay down in [biome]; ordinary grassland for the rest. */
+    private fun biomeProfile(biome: String): ColumnProfile = BIOME_PROFILES[biome]
+        ?: if (biome in SNOWY) ColumnProfile(SNOWY_GRASS, DIRT, 3, STONE) else MEADOW
+
+    private val BIOME_PROFILES: Map<String, ColumnProfile> by lazy {
+        fun stack(top: Material, filler: Material, depth: Int, deep: Material) =
+            ColumnProfile(top.createBlockData(), filler.createBlockData(), depth, deep.createBlockData())
+        val badlands = stack(Material.RED_SAND, Material.ORANGE_TERRACOTTA, 3, Material.TERRACOTTA)
+        val podzol = stack(Material.PODZOL, Material.DIRT, 3, Material.STONE)
+        val peaks = stack(Material.SNOW_BLOCK, Material.SNOW_BLOCK, 2, Material.STONE)
+        val stone = stack(Material.STONE, Material.STONE, 0, Material.STONE)
+        mapOf(
+            "minecraft:desert" to stack(Material.SAND, Material.SAND, 3, Material.SANDSTONE),
+            "minecraft:beach" to BEACH,
+            "minecraft:snowy_beach" to BEACH,
+            "minecraft:badlands" to badlands,
+            "minecraft:eroded_badlands" to badlands,
+            "minecraft:wooded_badlands" to badlands,
+            "minecraft:mushroom_fields" to stack(Material.MYCELIUM, Material.DIRT, 3, Material.STONE),
+            "minecraft:old_growth_pine_taiga" to podzol,
+            "minecraft:old_growth_spruce_taiga" to podzol,
+            "minecraft:snowy_slopes" to peaks,
+            "minecraft:jagged_peaks" to peaks,
+            "minecraft:frozen_peaks" to peaks,
+            "minecraft:ice_spikes" to peaks,
+            "minecraft:stony_peaks" to stone,
+            "minecraft:stony_shore" to stone,
+            "minecraft:mangrove_swamp" to stack(Material.MUD, Material.MUD, 3, Material.STONE),
+        )
     }
 
     /** Stone or deepslate fill gets vanilla-like ore veins; any other fill (sandstone, terracotta…) stays plain. */

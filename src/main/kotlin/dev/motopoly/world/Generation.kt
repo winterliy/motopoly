@@ -15,17 +15,17 @@ data class Generation(
          * width; [grid]'s margin must be wider than that.
          */
         fun design(
-            grid: SurfaceGrid, reference: SurfaceGrid?, params: GenerateParams,
+            grid: SurfaceGrid, vanilla: VanillaColumns?, params: GenerateParams,
             maxFillDepth: Int, copyPlants: Boolean, beachWidth: Int, fillOres: Boolean,
         ): Generation {
             val waterLevel = WaterInfo.levelOf(grid)
             // Under water the band meets the real floor, just like on land: the zone is pinned,
             // so a deep sea nearby only lengthens the slope down to it instead of dragging the zone along.
             val plan = TerrainGenerator.plan(
-                grid.heights, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, reference?.heights
+                grid.heights, grid.width, grid.depth, grid.margin, grid.originX, grid.originZ, params, vanilla?.heights
             )
             val changes = GenerateJob.computeChanges(
-                grid, plan, maxFillDepth, reference, copyPlants, waterLevel, beachWidth, params.seed(), fillOres,
+                grid, plan, maxFillDepth, vanilla, copyPlants, waterLevel, beachWidth, params.seed(), fillOres,
             )
             return Generation(plan, changes)
         }

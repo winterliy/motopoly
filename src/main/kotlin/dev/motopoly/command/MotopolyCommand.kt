@@ -10,10 +10,9 @@ import dev.motopoly.terrain.GenerateParams
 import dev.motopoly.terrain.TerrainGenerator
 import dev.motopoly.terrain.TerrainStats
 import dev.motopoly.world.GenerateJob
-import dev.motopoly.world.ReferenceWorlds
-import dev.motopoly.world.SurfaceGrid
-import dev.motopoly.world.SurfaceScanner
 import dev.motopoly.world.Generation
+import dev.motopoly.world.SurfaceScanner
+import dev.motopoly.world.VanillaTerrain
 import org.bukkit.Bukkit
 import org.bukkit.NamespacedKey
 import org.bukkit.command.Command
@@ -23,7 +22,6 @@ import org.bukkit.command.TabCompleter
 import org.bukkit.entity.Player
 import org.bukkit.persistence.PersistentDataType
 import java.util.UUID
-import java.util.concurrent.CompletableFuture
 
 private const val MAX_DISTANCE = 64
 private const val MAX_STEP = 16
@@ -274,24 +272,18 @@ class MotopolyCommand(private val plugin: MotopolyPlugin, private val wand: Wand
     private fun generate(player: Player, region: Region, params: GenerateParams) {
         busy += player.uniqueId
         val settings = plugin.settings
-        val refWorld = if (settings.referenceTerrain) {
-            if (Bukkit.getWorld(ReferenceWorlds.PREFIX + region.world.name) == null) {
-                player.msg("<gray>바닐라 참조 월드를 준비하는 중... (처음 한 번만)")
-            }
-            plugin.references.of(region.world)
-        } else {
-            null
-        }
         player.msg("<gray>주변 지형을 분석하고 땅을 설계하는 중...")
         // The band plus a fixed ring beyond it that holds the band's outer end.
         val margin = params.edge() + settings.analysisMargin
-        val main = SurfaceScanner.scan(region, margin, plugin.async)
-        val ref: CompletableFuture<SurfaceGrid?> = refWorld
-            ?.let { SurfaceScanner.scan(region.copy(world = it), margin, plugin.async).thenApply<SurfaceGrid?> { g -> g } }
-            ?: CompletableFuture.completedFuture(null)
-        main.thenCombineAsync(ref, { grid, refGrid ->
+        SurfaceScanner.scan(region, margin, plugin.async).thenApplyAsync({ grid ->
+            // What vanilla generates here, computed on the spot from the world's own generator.
+            val vanilla = if (settings.vanillaTerrain) {
+                VanillaTerrain.sample(grid.world, grid.originX, grid.originZ, grid.width, grid.depth, plugin.slF4JLogger)
+            } else {
+                null
+            }
             Generation.design(
-                grid, refGrid, params, settings.maxFillDepth, settings.copyPlants, settings.beachWidth, settings.fillOres,
+                grid, vanilla, params, settings.maxFillDepth, settings.copyPlants, settings.beachWidth, settings.fillOres,
             )
         }, plugin.async).whenComplete { result, error ->
             Bukkit.getScheduler().runTask(plugin, Runnable {
