@@ -51,13 +51,8 @@ object GenerateJob {
         OreTable.Ore.DIAMOND to Material.DEEPSLATE_DIAMOND_ORE,
     ).mapValues { it.value.createBlockData() }
     private val SNOW = Material.SNOW.createBlockData()
-    private val SNOWY_GRASS = (Material.GRASS_BLOCK.createBlockData() as Snowable).apply { isSnowy = true }
-    // Biomes whose ground vanilla covers with a snow layer.
-    private val SNOWY = setOf(
-        "minecraft:snowy_plains", "minecraft:snowy_taiga", "minecraft:grove", "minecraft:snowy_beach",
-    )
-    private val SHORT_GRASS = Material.SHORT_GRASS.createBlockData()
-    private val FLOWERS = listOf(Material.DANDELION.createBlockData(), Material.POPPY.createBlockData())
+    // Snow doesn't settle on these.
+    private val NO_SNOW = setOf(Material.ICE, Material.PACKED_ICE, Material.BLUE_ICE)
 
     /**
      * Works out every block edit for [plan]. Reads only from the snapshots in
@@ -95,6 +90,7 @@ object GenerateJob {
         val profiles = HashMap<Int, ColumnProfile>()
         val toWater = waterLevel?.let { distanceToWater(grid, plan, it) }
         val seabed = waterLevel?.let { Seabed(grid, seed) { x, y, z -> floorProfile(grid, x, y, z) } }
+        val vegetation = Vegetation(seed)
 
         for (iz in -band until d + band) {
             for (ix in -band until w + band) {
@@ -115,8 +111,9 @@ object GenerateJob {
                 fun outsideProfile() = profiles[outsideIndex]
                     ?: profileOf(grid, outsideX, grid.heights[outsideIndex], outsideZ)?.also { profiles[outsideIndex] = it }
 
-                // Vanilla's biome here, where vanilla itself has dry land.
-                val biome = vanilla?.takeIf { it.dry(gi) }?.biomes?.get(gi)
+                // What vanilla lays here, where vanilla itself has dry land.
+                val vanillaHere = vanilla != null && vanilla.dry(gi)
+                val snowy = vanillaHere && vanilla.snowy[gi]
                 val underwater = waterLevel != null && surface < waterLevel
                 val bed = if (seabed != null && (underwater || surface <= waterLevel!! + 2)) seabed.profileAt(x, z) else null
                 val sand = bed?.top?.material?.takeIf { it == Material.SAND || it == Material.RED_SAND }
@@ -130,16 +127,15 @@ object GenerateJob {
                     underwater -> bed ?: SEA_FLOOR
                     beach -> if (sand == Material.RED_SAND) RED_BEACH else BEACH
                     own != null -> own
-                    biome != null -> biomeProfile(biome)
+                    vanillaHere -> vanillaProfile(vanilla.stacks[gi], snowy)
                     outsideDry -> outsideProfile() ?: MEADOW
                     else -> MEADOW
                 }
                 val plants = when {
                     !copyPlants || underwater || beach -> emptyList()
                     own != null -> plantsAbove(grid, x, grid.heights[gi], z)
-                    biome != null && biome in SNOWY -> listOf(SNOW)
-                    profile.top.material == Material.GRASS_BLOCK -> scatteredPlant(x, z, seed)
-                    else -> emptyList()
+                    snowy -> if (profile.top.material in NO_SNOW) emptyList() else listOf(SNOW)
+                    else -> vegetation.plantsAt(if (vanillaHere) vanilla.biomes[gi] else "", profile.top.material, x, z)
                 }
 
                 fun set(y: Int, data: BlockData) {
@@ -204,37 +200,6 @@ object GenerateJob {
         return dist
     }
 
-    /** Roughly what vanilla's surface rules lay down in [biome]; ordinary grassland for the rest. */
-    private fun biomeProfile(biome: String): ColumnProfile = BIOME_PROFILES[biome]
-        ?: if (biome in SNOWY) ColumnProfile(SNOWY_GRASS, DIRT, 3, STONE) else MEADOW
-
-    private val BIOME_PROFILES: Map<String, ColumnProfile> = run {
-        fun stack(top: Material, filler: Material, depth: Int, deep: Material) =
-            ColumnProfile(top.createBlockData(), filler.createBlockData(), depth, deep.createBlockData())
-        val badlands = stack(Material.RED_SAND, Material.ORANGE_TERRACOTTA, 3, Material.TERRACOTTA)
-        val podzol = stack(Material.PODZOL, Material.DIRT, 3, Material.STONE)
-        val peaks = stack(Material.SNOW_BLOCK, Material.SNOW_BLOCK, 2, Material.STONE)
-        val stone = stack(Material.STONE, Material.STONE, 0, Material.STONE)
-        mapOf(
-            "minecraft:desert" to stack(Material.SAND, Material.SAND, 3, Material.SANDSTONE),
-            "minecraft:beach" to BEACH,
-            "minecraft:snowy_beach" to BEACH,
-            "minecraft:badlands" to badlands,
-            "minecraft:eroded_badlands" to badlands,
-            "minecraft:wooded_badlands" to badlands,
-            "minecraft:mushroom_fields" to stack(Material.MYCELIUM, Material.DIRT, 3, Material.STONE),
-            "minecraft:old_growth_pine_taiga" to podzol,
-            "minecraft:old_growth_spruce_taiga" to podzol,
-            "minecraft:snowy_slopes" to peaks,
-            "minecraft:jagged_peaks" to peaks,
-            "minecraft:frozen_peaks" to peaks,
-            "minecraft:ice_spikes" to peaks,
-            "minecraft:stony_peaks" to stone,
-            "minecraft:stony_shore" to stone,
-            "minecraft:mangrove_swamp" to stack(Material.MUD, Material.MUD, 3, Material.STONE),
-        )
-    }
-
     /** Stone or deepslate fill gets vanilla-like ore veins; any other fill (sandstone, terracotta…) stays plain. */
     private fun oreIn(rock: BlockData, x: Int, y: Int, z: Int, seed: Long): BlockData {
         val ores = when (rock.material) {
@@ -243,20 +208,6 @@ object GenerateJob {
             else -> return rock
         }
         return OreTable.pick(x, y, z, seed)?.let { ores.getValue(it) } ?: rock
-    }
-
-    /** Sparse grass and the odd flower, roughly vanilla plains density; stable per position. */
-    private fun scatteredPlant(x: Int, z: Int, seed: Long): List<BlockData> {
-        var h = seed xor (x.toLong() * 0x9E3779B97F4A7C15uL.toLong()) xor (z.toLong() * 0xC2B2AE3D27D4EB4FuL.toLong())
-        h = (h xor (h ushr 33)) * -0xae502812aa7333L
-        h = (h xor (h ushr 33)) * -0x3b314601e57a13adL
-        h = h xor (h ushr 33)
-        val r = (h ushr 11).toDouble() / (1L shl 53)
-        return when {
-            r < 0.16 -> listOf(SHORT_GRASS)
-            r < 0.175 -> listOf(FLOWERS[((h ushr 3) and 1).toInt()])
-            else -> emptyList()
-        }
     }
 
     /**
@@ -298,24 +249,30 @@ object GenerateJob {
     /** Null when the column has no ground to copy at [surface] (e.g. water opening into a cave). */
     private fun profileOf(grid: SurfaceGrid, x: Int, surface: Int, z: Int): ColumnProfile? {
         val floor = grid.world.minHeight
-        if (!SurfaceScanner.isTerrain(grid.type(x, surface, z))) return null
-        val top = grid.blockData(x, surface, z)
-        if (surface - 1 < floor || !SurfaceScanner.isTerrain(grid.type(x, surface - 1, z))) {
+        return stackProfile { d -> if (surface - d >= floor) grid.blockData(x, surface - d, z) else null }
+    }
+
+    /** Vanilla's own stack for a column; snow-covered grass where snow would settle. */
+    private fun vanillaProfile(stack: Array<BlockData>, snowy: Boolean): ColumnProfile {
+        val p = stackProfile { d -> stack.getOrNull(d) } ?: return MEADOW
+        if (!snowy || p.top.material != Material.GRASS_BLOCK) return p
+        return ColumnProfile((p.top.clone() as Snowable).apply { isSnowy = true }, p.filler, p.fillerDepth, p.deep)
+    }
+
+    /**
+     * Top block, the run of filler under it and what lies beneath, from [at]
+     * (the block d below the top, null past the bottom of the world).
+     * Null when the top isn't ground (e.g. water opening into a cave).
+     */
+    private fun stackProfile(at: (d: Int) -> BlockData?): ColumnProfile? {
+        fun ground(d: Int) = at(d)?.takeIf { SurfaceScanner.isTerrain(it.material) }
+        val top = ground(0) ?: return null
+        val filler = ground(1)
             // Nothing to copy below (a cave right under the surface): soil under topsoil, then stone.
-            return if (top.material in TOPSOIL) ColumnProfile(top, DIRT, 3, STONE) else ColumnProfile(top, top, 0, STONE)
-        }
-        val filler = grid.blockData(x, surface - 1, z)
+            ?: return if (top.material in TOPSOIL) ColumnProfile(top, DIRT, 3, STONE) else ColumnProfile(top, top, 0, STONE)
         var depth = 1
-        while (depth < MAX_FILLER_DEPTH && surface - 1 - depth >= floor &&
-            grid.type(x, surface - 1 - depth, z) == filler.material
-        ) depth++
-        val deepY = surface - 1 - depth
-        val deep = if (deepY >= floor && SurfaceScanner.isTerrain(grid.type(x, deepY, z))) {
-            grid.blockData(x, deepY, z)
-        } else {
-            STONE
-        }
-        return ColumnProfile(top, filler, depth, deep)
+        while (depth < MAX_FILLER_DEPTH && at(1 + depth)?.material == filler.material) depth++
+        return ColumnProfile(top, filler, depth, ground(1 + depth) ?: STONE)
     }
 
     /**
