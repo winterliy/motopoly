@@ -5,3 +5,7 @@ run/
 .idea/
 *.iml
 .DS_Store
+
+# documentation kept locally only
+*.md
+README*
